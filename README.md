@@ -46,7 +46,7 @@ DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 
 ```bash
 # 下载地址：https://github.com/GHJIVHIDD/dsh-plugin-vm-sandbox/releases
-dsh plugin --profile web add ./dsh-plugin-vm-sandbox-0.0.1.tgz
+dsh plugin --profile web add ./dsh-plugin-vm-sandbox-0.0.2.tgz
 ```
 
 因为本插件同时带有 `dsh.bundle` 声明，`dsh plugin` 会自动把它加入 profile 的 `bundles` 层，并应用 `cordis.patch.yml` 自动插入虚拟机页签。
@@ -127,7 +127,7 @@ dsh --profile web
 
 ## 更新内容
 
-### v0.0.1（最新）
+### v0.0.2（最新）
 
 - 新增虚拟机 Shell 实时执行记录：
   - 记录 `vm_exec` 执行的命令、开始/结束时间、耗时、退出码、stdout/stderr 和运行状态
@@ -143,4 +143,4 @@ dsh --profile web
 - 面向 DeepSeek Harness `web` profile
 - 需要 Web 端已启用 `@deepseek-ai/dsh-client-runtime` 与 `@deepseek-ai/dsh-client-ui-conversation`（标准 web profile 自带）
 - 宿主机需要安装并运行 OrbStack，`orb` 命令位于 `/usr/local/bin/orb`
-- 插件版本：0.0.1
+- 插件版本：0.0.2
