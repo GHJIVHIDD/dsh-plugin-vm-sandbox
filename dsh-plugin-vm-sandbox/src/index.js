@@ -45,7 +45,10 @@ function loadStateFile() {
 let state = loadStateFile()
 let knownArchived = new Set()
 const inFlight = new Map()
+const shellLogs = new Map()
 let sweeping = false
+
+const SHELL_LOG_LIMIT = 200
 
 function saveState() {
   try {
@@ -94,6 +97,18 @@ async function orb(args, opts) {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+// ---------- Shell 执行记录(仅内存,按机器名保留最近 N 条) ----------
+function pushShellLog(name, entry) {
+  if (!shellLogs.has(name)) shellLogs.set(name, [])
+  const list = shellLogs.get(name)
+  list.push(entry)
+  if (list.length > SHELL_LOG_LIMIT) list.splice(0, list.length - SHELL_LOG_LIMIT)
+}
+
+function shellLogView(name) {
+  return { ok: true, name, entries: shellLogs.get(name) || [] }
+}
 
 async function listMachines() {
   const res = await orb(['list', '-f', 'json'], { timeoutMs: 60000 })
@@ -269,6 +284,7 @@ async function ensureSessionMachine(ctx, sessionId, distro, signal) {
 
 async function deleteMachineByName(name) {
   const res = await orb(['delete', '-f', name], { timeoutMs: 180000 })
+  if (res.exitCode === 0) shellLogs.delete(name)
   return res.exitCode === 0
 }
 
@@ -388,6 +404,9 @@ async function reconcile(ctx) {
   try {
     const machines = await listMachines()
     const names = new Set(machines.map((m) => m.name))
+    for (const key of Array.from(shellLogs.keys())) {
+      if (!names.has(key)) shellLogs.delete(key)
+    }
     let changed = false
     for (const sid of Object.keys(state.machines)) {
       if (!names.has(state.machines[sid].name)) {
@@ -581,6 +600,17 @@ function apply(ctx) {
       }
     })
 
+    route('/vmsb-api/shell', async (req, res) => {
+      try {
+        const q = queryOf(req)
+        const name = q.get('name') || ''
+        if (!name) throw new Error('缺少机器名称')
+        sendJson(res, 200, shellLogView(name))
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+      }
+    })
+
     route('/vmsb-api/start', async (req, res) => {
       try {
         const q = queryOf(req)
@@ -708,7 +738,30 @@ function apply(ctx) {
         const rec = await ensureSessionMachine(ctx, sessionId, distro, exec.signal)
         await ensureRunning(rec.name)
         await enforceRunningCap(rec.name)
-        const run = await orb(['run', '-m', rec.name, '-u', 'root', 'sh', '-lc', command], { timeoutMs, signal: exec.signal })
+        const entry = {
+          id: 'shell-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
+          machine: rec.name,
+          command,
+          startTime: Date.now(),
+          endTime: null,
+          durationMs: null,
+          exitCode: null,
+          stdout: '',
+          stderr: '',
+          status: 'running',
+        }
+        pushShellLog(rec.name, entry)
+        let run
+        try {
+          run = await orb(['run', '-m', rec.name, '-u', 'root', 'sh', '-lc', command], { timeoutMs, signal: exec.signal })
+        } finally {
+          entry.endTime = Date.now()
+          entry.durationMs = entry.endTime - entry.startTime
+          entry.exitCode = run ? run.exitCode : -1
+          entry.stdout = run ? run.stdout : ''
+          entry.stderr = run ? run.stderr : ''
+          entry.status = run && run.exitCode === 0 ? 'ok' : 'bad'
+        }
         return {
           machine: rec.name,
           distro: rec.distro,

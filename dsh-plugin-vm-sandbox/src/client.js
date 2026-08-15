@@ -43,6 +43,28 @@ window.__ModuleLoader__.load({
 .vmsb-detail-cell { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
 .vmsb-detail-k { color: var(--dsw-alias-label-secondary, #8d8d8d); width: 72px; flex: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vmsb-detail-v { word-break: break-all; min-width: 0; }
+.vmsb-shell { margin-top: 10px; border-top: 1px dashed var(--dsw-alias-border-l1, rgba(128,128,128,.25)); padding-top: 8px; }
+.vmsb-shell-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.vmsb-shell-title { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12px; color: var(--dsw-alias-label-primary, inherit); }
+.vmsb-shell-live { display: inline-flex; align-items: center; gap: 5px; color: var(--dsw-alias-label-secondary, #8d8d8d); font-size: 11px; white-space: nowrap; }
+.vmsb-shell-live .vmsb-live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-label-secondary, #8d8d8d); animation: vmsb-pulse 1.6s ease-in-out infinite; }
+@keyframes vmsb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+.vmsb-shell-list { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; }
+.vmsb-shell-row { flex: none; border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.25)); border-left: 3px solid var(--dsw-alias-border-l2, rgba(128,128,128,.35)); border-radius: 8px; background: var(--dsw-alias-bg-layer-1, transparent); padding: 7px 10px 8px; box-sizing: border-box; min-width: 0; }
+.vmsb-shell-row[data-status=running] { border-left-color: var(--dsw-alias-border-l2, rgba(128,128,128,.35)); }
+.vmsb-shell-row[data-open="1"] .vmsb-shell-chev { transform: rotate(90deg); }
+.vmsb-shell-headline { display: flex; align-items: center; gap: 7px; min-width: 0; cursor: pointer; }
+.vmsb-shell-chev { flex: none; width: 12px; font-size: 10px; line-height: 16px; color: var(--dsw-alias-label-secondary, #8d8d8d); text-align: center; transition: transform .12s ease; }
+.vmsb-shell-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dsw-alias-label-secondary, #8d8d8d); flex: none; }
+.vmsb-shell-dot.running { animation: vmsb-pulse 1.1s ease-in-out infinite; }
+.vmsb-shell-cmd { flex: 1 1 auto; min-width: 0; font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-primary, inherit); white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere; }
+.vmsb-shell-time { flex: none; color: var(--dsw-alias-label-secondary, #8d8d8d); font-size: 10.5px; line-height: 16px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.vmsb-shell-dur { flex: none; color: var(--dsw-alias-label-secondary, #8d8d8d); font-size: 10.5px; line-height: 16px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.vmsb-shell-status { flex: none; color: var(--dsw-alias-label-secondary, #8d8d8d); font-size: 10.5px; line-height: 16px; padding: 0 7px; border-radius: 999px; background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,.12)); border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.25)); white-space: nowrap; }
+.vmsb-shell-running { margin-top: 6px; color: var(--dsw-alias-label-secondary, #8d8d8d); font-size: 11.5px; line-height: 17px; display: flex; align-items: center; gap: 6px; }
+.vmsb-shell-running::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--dsw-alias-label-secondary, #8d8d8d); animation: vmsb-pulse 1.1s ease-in-out infinite; flex: none; }
+.vmsb-shell-out { margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.25)); border-radius: 6px; background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,.12)); color: var(--dsw-alias-label-secondary, #8d8d8d); font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); font-size: 11.5px; line-height: 18px; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; overscroll-behavior: contain; }
+.vmsb-shell-empty { color: var(--dsw-alias-label-secondary, #8d8d8d); font-size: 11.5px; line-height: 18px; padding: 8px 0; text-align: center; }
 `;
 
 		// ── helpers ────────────────────────────────────────────────────────────
@@ -95,6 +117,71 @@ window.__ModuleLoader__.load({
 		function fmtCpu(n) { return !n || n === "0" ? "默认" : n + " 核"; }
 		function fmtBool(v) { return v ? "是" : "否"; }
 
+		function formatTime(ms) {
+			if (!ms) return "—";
+			const d = new Date(ms);
+			const p = (n) => String(n).padStart(2, "0");
+			return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+		}
+		function formatDur(ms) {
+			if (ms === null || ms === undefined) return "";
+			if (ms < 1000) return ms + "ms";
+			const s = ms / 1000;
+			if (s < 60) return s.toFixed(1) + "s";
+			const m = Math.floor(s / 60);
+			return m + "m " + String(Math.round(s % 60)).padStart(2, "0") + "s";
+		}
+		function shellStatusText(entry) {
+			if (entry.status === "running") return "运行中";
+			if (entry.status === "bad" || entry.status === "error") {
+				if (entry.exitCode !== null && entry.exitCode !== 0) return "退出码 " + entry.exitCode;
+				return "失败";
+			}
+			return "成功";
+		}
+
+		// ── shell row ──────────────────────────────────────────────────────────
+		function ShellRow(props) {
+			const entry = props.entry;
+			const [open, setOpen] = React.useState(false);
+			const canExpand = entry.status !== "running";
+			const durationMs = entry.durationMs != null ? entry.durationMs : (entry.endTime && entry.startTime ? entry.endTime - entry.startTime : null);
+			const toggle = () => { if (canExpand) setOpen(!open); };
+			const onKeyDown = (event) => {
+				if (event.key === "Enter" || event.key === " ") {
+					event.preventDefault();
+					toggle();
+				}
+			};
+			const children = [
+				React.createElement("div", {
+					className: "vmsb-shell-headline",
+					role: "button",
+					tabIndex: 0,
+					"aria-expanded": open ? "true" : "false",
+					onClick: toggle,
+					onKeyDown: onKeyDown,
+					title: canExpand ? (open ? "点击收起输出" : "点击展开输出") : undefined,
+				},
+					React.createElement("span", { className: "vmsb-shell-chev" }, "▸"),
+					React.createElement("span", { className: "vmsb-shell-dot" + (entry.status === "running" ? " running" : "") }),
+					React.createElement("code", { className: "vmsb-shell-cmd" }, "$ " + entry.command),
+					React.createElement("span", { className: "vmsb-shell-time" }, formatTime(entry.startTime)),
+					durationMs !== null && durationMs !== undefined && React.createElement("span", { className: "vmsb-shell-dur" }, formatDur(durationMs)),
+					React.createElement("span", { className: "vmsb-shell-status" }, shellStatusText(entry)),
+				),
+			];
+			if (entry.status === "running") {
+				children.push(React.createElement("div", { className: "vmsb-shell-running" }, "命令执行中，完成后将显示结果…"));
+			} else if (open) {
+				const output = [];
+				if (entry.stdout) output.push(entry.stdout);
+				if (entry.stderr) output.push(entry.stderr);
+				children.push(React.createElement("pre", { className: "vmsb-shell-out" }, output.length > 0 ? output.join("\n") : "(无输出)"));
+			}
+			return React.createElement("div", { className: "vmsb-shell-row", "data-status": entry.status, "data-open": open ? "1" : "0" }, ...children);
+		}
+
 		// ── view ───────────────────────────────────────────────────────────────
 		function VMView(props) {
 			const sessionId = props.sessionId;
@@ -105,6 +192,8 @@ window.__ModuleLoader__.load({
 			const [expanded, setExpanded] = React.useState(null);
 			const [details, setDetails] = React.useState({});
 			const [detailErr, setDetailErr] = React.useState({});
+			const [shells, setShells] = React.useState({});
+			const [shellErr, setShellErr] = React.useState({});
 
 			React.useEffect(() => {
 				let stopped = false;
@@ -119,6 +208,28 @@ window.__ModuleLoader__.load({
 				timerId = window.setInterval(refresh, 8000);
 				return () => { stopped = true; if (timerId !== null) window.clearInterval(timerId); };
 			}, [sessionId]);
+
+			React.useEffect(() => {
+				if (!expanded) return;
+				let stopped = false;
+				let timerId = null;
+				const refresh = () => {
+					api("shell", { name: expanded, session: sessionId }).then(
+						(res) => {
+							if (stopped) return;
+							setShells((s) => Object.assign({}, s, { [expanded]: res.entries || [] }));
+							setShellErr((e) => { const n = Object.assign({}, e); delete n[expanded]; return n; });
+						},
+						(err) => {
+							if (stopped) return;
+							setShellErr((e) => Object.assign({}, e, { [expanded]: String((err && err.message) || err) }));
+						},
+					);
+				};
+				refresh();
+				timerId = window.setInterval(refresh, 2000);
+				return () => { stopped = true; if (timerId !== null) window.clearInterval(timerId); };
+			}, [expanded, sessionId]);
 
 			const act = React.useCallback((action, name) => {
 				setBusy((b) => Object.assign({}, b, { [name]: action }));
@@ -163,20 +274,45 @@ window.__ModuleLoader__.load({
 
 			const stop = (e) => { if (e && e.stopPropagation) e.stopPropagation(); };
 
+			const renderShell = (m) => {
+				const entries = shells[m.name];
+				const err = shellErr[m.name];
+				const head = React.createElement("div", { className: "vmsb-shell-head" },
+					React.createElement("span", { className: "vmsb-shell-title" }, "Shell 实时记录"),
+					React.createElement("span", { className: "vmsb-shell-live" },
+						React.createElement("span", { className: "vmsb-live-dot" }),
+						"实时"));
+				let body;
+				if (err) {
+					body = React.createElement("div", { className: "vmsb-shell-empty" }, err);
+				} else if (entries === undefined) {
+					body = React.createElement("div", { className: "vmsb-shell-empty" }, "加载中…");
+				} else if (entries.length === 0) {
+					body = React.createElement("div", { className: "vmsb-shell-empty" }, "暂无 shell 命令记录");
+				} else {
+					body = React.createElement("div", { className: "vmsb-shell-list" },
+						entries.map((entry) => React.createElement(ShellRow, { key: entry.id, entry: entry })));
+				}
+				return React.createElement("div", { className: "vmsb-shell" }, head, body);
+			};
+
 			const renderDetail = (m) => {
 				if (expanded !== m.name) return null;
 				const d = details[m.name];
 				const err = detailErr[m.name];
-				if (err) return React.createElement("div", { className: "vmsb-detail" }, React.createElement("div", { className: "vmsb-error" }, err));
-				if (!d) return React.createElement("div", { className: "vmsb-detail" }, React.createElement("div", { className: "vmsb-muted" }, "加载中…"));
-				const img = d.image || {};
-				const cfg = d.config || {};
-				const lim = d.limits || {};
-				const cell = (k, v, extra) => React.createElement("span", { className: "vmsb-detail-cell", key: k },
-					React.createElement("span", { className: "vmsb-detail-k" }, k),
-					React.createElement("span", { className: "vmsb-detail-v" + (extra || "") }, v == null || v === "" ? "—" : String(v)));
-				return React.createElement("div", { className: "vmsb-detail" },
-					React.createElement("div", { className: "vmsb-detail-grid" },
+				const children = [];
+				if (err) {
+					children.push(React.createElement("div", { className: "vmsb-error" }, err));
+				} else if (!d) {
+					children.push(React.createElement("div", { className: "vmsb-muted" }, "加载中…"));
+				} else {
+					const img = d.image || {};
+					const cfg = d.config || {};
+					const lim = d.limits || {};
+					const cell = (k, v, extra) => React.createElement("span", { className: "vmsb-detail-cell", key: k },
+						React.createElement("span", { className: "vmsb-detail-k" }, k),
+						React.createElement("span", { className: "vmsb-detail-v" + (extra || "") }, v == null || v === "" ? "—" : String(v)));
+					children.push(React.createElement("div", { className: "vmsb-detail-grid" },
 						cell("机器 ID", d.id),
 						cell("状态", d.state ? (STATE_LABEL[d.state] || d.state) : "—", STATE_TEXT_CLASS[d.state] || ""),
 						cell("名称", d.name),
@@ -197,8 +333,10 @@ window.__ModuleLoader__.load({
 						cell("磁盘用量", fmtBytes(d.diskSizeBytes)),
 						cell("IPv4", d.ip4),
 						cell("IPv6", d.ip6),
-					),
-				);
+					));
+				}
+				children.push(renderShell(m));
+				return React.createElement("div", { className: "vmsb-detail" }, ...children);
 			};
 
 			const machines = data ? data.machines : null;
