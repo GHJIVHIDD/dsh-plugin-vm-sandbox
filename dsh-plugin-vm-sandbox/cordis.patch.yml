@@ -1,0 +1,5 @@
+# VM sandbox (deployment plugin): inserts the "虚拟机" tab into the conversation view.
+# The host half serves /vmsb-api/* routes and registers vm_list/vm_create/vm_exec/vm_delete tools.
+- insert:
+    - id: ui-vm-sandbox
+      name: '@deepseek-ai/dsh-plugin-vm-sandbox'

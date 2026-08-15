@@ -1,0 +1,33 @@
+{
+  "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
+  "version": "0.0.1",
+  "description": "OrbStack VM sandbox: per-session sandbox VMs (debian/alpine) with a VM tab next to trajectory/terminal, vm_list/vm_create/vm_exec/vm_delete tools, archive/delete cleanup, running cap, idle sleep and compact detail view.",
+  "type": "module",
+  "scripts": {
+    "prepare": "node ./scripts/prepare.mjs"
+  },
+  "main": "dsh-plugin-vm-sandbox/lib/index.js",
+  "exports": {
+    ".": "./dsh-plugin-vm-sandbox/lib/index.js",
+    "./client": "./dsh-plugin-vm-sandbox/lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh-plugin-vm-sandbox/lib",
+    "dsh-plugin-vm-sandbox/cordis.patch.yml",
+    "scripts"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh-plugin-vm-sandbox/cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "license": "MIT"
+}
