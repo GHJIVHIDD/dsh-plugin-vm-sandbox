@@ -13,9 +13,11 @@ Thumbs.db
 .vscode/
 *.swp
 
-# Installation packages are published as GitHub Releases, not committed to source.
+# Installation packages: keep the built release artifacts in the repo as well.
 *.tgz
 *.zip
+!dsh-plugin-vm-sandbox-*.tgz
+!dsh-plugin-vm-sandbox-share.zip
 
 # Local credential store (never commit)
 .git-credentials

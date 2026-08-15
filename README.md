@@ -34,7 +34,7 @@ DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
         └── prepare.mjs        # 内层包 prepare：构建 lib/
 ```
 
-> 安装包（`tgz` / `zip`）通过 **GitHub Releases** 发布，不存放在源码仓库中。
+> 安装包（`tgz` / `zip`）已一并保留在仓库中，也可同时上传到 **GitHub Releases** 发布。
 > 仓库根目录本身也是可安装的 bundle，因此也支持 `dsh plugin add github:...` 源码安装。
 
 ## 安装
