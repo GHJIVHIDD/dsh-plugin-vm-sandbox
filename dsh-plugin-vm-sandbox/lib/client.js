@@ -195,6 +195,8 @@ window.__ModuleLoader__.load({
 			const [shells, setShells] = React.useState({});
 			const [shellErr, setShellErr] = React.useState({});
 			const [creating, setCreating] = React.useState(null);
+			// 正在创建的机器(宿主立即返回名字,实际建机约 1-3 分钟):[{ machine, distro, since }]
+			const [pending, setPending] = React.useState([]);
 
 			const refreshList = React.useCallback(() => {
 				api("list", { session: sessionId }).then(
@@ -257,7 +259,18 @@ window.__ModuleLoader__.load({
 			const onCreate = React.useCallback((distro) => {
 				setCreating(distro);
 				api("create", { session: sessionId, distro }).then(
-					() => { setCreating(null); refreshList(); },
+					(res) => {
+						setCreating(null);
+						if (res && res.machine) {
+							setPending((p) => {
+								const now = Date.now();
+								const next = p.filter((x) => x.machine !== res.machine && now - x.since < 10 * 60 * 1000);
+								next.push({ machine: res.machine, distro: res.distro || distro, since: now });
+								return next;
+							});
+						}
+						refreshList();
+					},
 					(err) => { setCreating(null); setError(String((err && err.message) || err)); },
 				);
 			}, [sessionId, refreshList]);
@@ -360,10 +373,13 @@ window.__ModuleLoader__.load({
 			// 仅当宿主为 v0.0.3+(返回 cap 字段)时才显示新建等新能力,避免旧宿主 404
 			const canCreate = !!(data && typeof data.cap === "number");
 			const runningCount = machines ? machines.filter((m) => m.state === "running").length : 0;
+			const machineNames = new Set(machines ? machines.map((m) => m.name) : []);
+			const pendingRows = (pending || []).filter((p) => !machineNames.has(p.machine) && Date.now() - p.since < 10 * 60 * 1000);
 
-			const rows = machines === null ? null : machines.length === 0
+			const rows = machines === null ? null : machines.length === 0 && pendingRows.length === 0
 				? React.createElement("div", { className: "vmsb-muted" }, "当前没有 OrbStack 虚拟机。可新建(debian/alpine),或由会话智能体通过 vm_exec / vm_create 创建沙箱。")
-				: React.createElement("div", { className: "vmsb-list" }, machines.map((m) => {
+				: React.createElement("div", { className: "vmsb-list" },
+					machines.map((m) => {
 					const isOwn = m.ownedByThis || ownNames.has(m.name);
 					const busyName = busy[m.name];
 					const isOpen = expanded === m.name;
@@ -388,7 +404,18 @@ window.__ModuleLoader__.load({
 						),
 						renderDetail(m),
 					);
-				}));
+				}),
+					pendingRows.map((p) => React.createElement("div", { key: "pending-" + p.machine, className: "vmsb-item" },
+						React.createElement("div", { className: "vmsb-row" },
+							React.createElement("span", { className: "vmsb-chev" }, "▸"),
+							React.createElement("span", { className: "vmsb-dot vmsb-dot-sleep" }),
+							React.createElement("span", { className: "vmsb-name" }, p.machine),
+							React.createElement("span", { className: "vmsb-meta" }, p.distro),
+							React.createElement("span", { className: "vmsb-state vmsb-state-sleep" }, "创建中…"),
+							React.createElement("span", { className: "vmsb-owner" }, "约 1-3 分钟"),
+						),
+					)),
+				);
 
 			return React.createElement("div", { className: "vmsb-panel" },
 				React.createElement("div", { className: "vmsb-head" },

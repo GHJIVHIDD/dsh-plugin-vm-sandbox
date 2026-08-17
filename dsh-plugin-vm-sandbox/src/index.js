@@ -111,7 +111,8 @@ async function orb(args, opts) {
       timeout,
       maxBuffer: 8 * 1024 * 1024,
       encoding: 'utf8',
-      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+      // 注意:execFile 的 signal 不能为 null(会抛 ERR_INVALID_ARG_TYPE),仅传真 AbortSignal
+      ...(opts.signal != null ? { signal: opts.signal } : {}),
     })
     return { exitCode: 0, stdout: String(stdout || ''), stderr: String(stderr || '') }
   } catch (err) {
