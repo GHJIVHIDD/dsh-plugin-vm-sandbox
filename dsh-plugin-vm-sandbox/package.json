@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "OrbStack VM sandbox: per-session sandbox VMs (debian/alpine) with a VM tab next to trajectory/terminal, vm_list/vm_create/vm_exec/vm_delete tools, archive/delete cleanup, running cap, idle sleep, compact detail view and live shell logs.",
   "type": "module",
   "scripts": {

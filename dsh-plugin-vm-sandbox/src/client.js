@@ -194,6 +194,14 @@ window.__ModuleLoader__.load({
 			const [detailErr, setDetailErr] = React.useState({});
 			const [shells, setShells] = React.useState({});
 			const [shellErr, setShellErr] = React.useState({});
+			const [creating, setCreating] = React.useState(null);
+
+			const refreshList = React.useCallback(() => {
+				api("list", { session: sessionId }).then(
+					(res) => { setData(res); setError(null); },
+					(err) => setError(String((err && err.message) || err)),
+				);
+			}, [sessionId]);
 
 			React.useEffect(() => {
 				let stopped = false;
@@ -237,17 +245,22 @@ window.__ModuleLoader__.load({
 					() => {
 						setBusy((b) => { const n = Object.assign({}, b); delete n[name]; return n; });
 						setConfirmDel(null);
-						api("list", { session: sessionId }).then(
-							(res) => { setData(res); setError(null); },
-							(err) => setError(String((err && err.message) || err)),
-						);
+						refreshList();
 					},
 					(err) => {
 						setBusy((b) => { const n = Object.assign({}, b); delete n[name]; return n; });
 						setError(String((err && err.message) || err));
 					},
 				);
-			}, [sessionId]);
+			}, [sessionId, refreshList]);
+
+			const onCreate = React.useCallback((distro) => {
+				setCreating(distro);
+				api("create", { session: sessionId, distro }).then(
+					() => { setCreating(null); refreshList(); },
+					(err) => { setCreating(null); setError(String((err && err.message) || err)); },
+				);
+			}, [sessionId, refreshList]);
 
 			const onDelete = React.useCallback((name) => {
 				if (confirmDel === name) {
@@ -341,12 +354,13 @@ window.__ModuleLoader__.load({
 
 			const machines = data ? data.machines : null;
 			const own = data ? data.own : null;
+			const ownNames = new Set((own || []).map((o) => o.name));
 			const runningCount = machines ? machines.filter((m) => m.state === "running").length : 0;
 
 			const rows = machines === null ? null : machines.length === 0
-				? React.createElement("div", { className: "vmsb-muted" }, "当前没有 OrbStack 虚拟机。会话智能体可通过 vm_exec / vm_create 创建沙箱。")
+				? React.createElement("div", { className: "vmsb-muted" }, "当前没有 OrbStack 虚拟机。点击上方「＋ Debian / ＋ Alpine」新建,或由会话智能体通过 vm_exec / vm_create 创建沙箱。")
 				: React.createElement("div", { className: "vmsb-list" }, machines.map((m) => {
-					const isOwn = m.ownedByThis || (own && own.name === m.name);
+					const isOwn = m.ownedByThis || ownNames.has(m.name);
 					const busyName = busy[m.name];
 					const isOpen = expanded === m.name;
 					return React.createElement("div", { key: m.name, className: "vmsb-item" },
@@ -375,11 +389,10 @@ window.__ModuleLoader__.load({
 			return React.createElement("div", { className: "vmsb-panel" },
 				React.createElement("div", { className: "vmsb-head" },
 					React.createElement("span", { className: "vmsb-title" }, "虚拟机沙箱 (OrbStack)"),
-					React.createElement("span", { className: "vmsb-count" }, machines === null ? "" : "共 " + machines.length + " 台 · 运行 " + runningCount),
-					React.createElement("button", { className: "vmsb-btn", onClick: () => api("list", { session: sessionId }).then(
-						(res) => { setData(res); setError(null); },
-						(err) => setError(String((err && err.message) || err)),
-					) }, "刷新"),
+					React.createElement("span", { className: "vmsb-count" }, machines === null ? "" : "共 " + machines.length + " 台 · 运行 " + runningCount + (data && data.cap ? " · 上限 " + data.cap : "") + (own && own.length ? " · 本会话 " + own.length + " 台" : "")),
+					React.createElement("button", { className: "vmsb-btn", disabled: !!creating, onClick: () => onCreate("debian") }, creating === "debian" ? "创建中…" : "＋ Debian"),
+					React.createElement("button", { className: "vmsb-btn", disabled: !!creating, onClick: () => onCreate("alpine") }, creating === "alpine" ? "创建中…" : "＋ Alpine"),
+					React.createElement("button", { className: "vmsb-btn", onClick: refreshList }, "刷新"),
 				),
 				error ? React.createElement("div", { className: "vmsb-error" }, error) : null,
 				machines === null ? React.createElement("div", { className: "vmsb-muted" }, "加载中…") : rows,

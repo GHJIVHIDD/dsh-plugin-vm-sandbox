@@ -2,18 +2,19 @@
 
 DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 
-在会话视图环中新增「虚拟机」页签，为每个会话提供 OrbStack 沙箱虚拟机（debian/alpine），支持查看/启停/删除、展开查看详细配置，并提供 `vm_list` / `vm_create` / `vm_exec` / `vm_delete` 模型工具。状态持久化在 `~/.dsh/vm-sandbox/state.json`。
+在会话视图环中新增「虚拟机」页签，为每个会话提供 OrbStack 沙箱虚拟机（debian/alpine，同一会话必要时可多台），支持一键新建/查看/启停/删除、展开查看详细配置，并提供 `vm_list` / `vm_create` / `vm_exec` / `vm_delete` 模型工具（支持 `machine` 参数，必要情况下可跨会话使用）。状态持久化在 `~/.dsh/vm-sandbox/state.json`。
 
 ## 功能
 
 - 会话视图环中新增「虚拟机」页签
-- 每会话一台 OrbStack 沙箱虚拟机，支持 debian（默认）与 alpine
+- 同一会话可创建多台 OrbStack 沙箱虚拟机（必要时），支持 debian（默认）与 alpine；`vm_exec` 省略 `machine` 时复用本会话默认机器
+- 跨会话使用：通过 `vm_exec` / `vm_create` 的 `machine` 参数可指定并执行其他会话的虚拟机（删除仍仅限归属会话）
 - 实时展示所有沙箱：名称、发行版、状态、归属会话
 - 展开查看机器 ID、CPU/内存/磁盘限额、网络/SSH 配置、IP 等详情
 - 展开后实时查看该虚拟机的 Shell 执行记录：命令、运行状态、耗时与输出结果（折叠式展示）
-- 支持启动、休眠、删除（删除需二次确认）
-- 模型工具：`vm_list` / `vm_create` / `vm_exec` / `vm_delete`
-- 资源治理：全局运行上限 5 台、闲置 30 分钟自动休眠、归档/删除会话自动清理
+- 面板支持一键新建（debian/alpine）、启动、休眠、删除（删除需二次确认）
+- 模型工具：`vm_list` / `vm_create` / `vm_exec` / `vm_delete`（`vm_create` / `vm_exec` / `vm_delete` 均支持 `machine` 参数）
+- 资源治理：全局运行上限 25 台、每会话上限 8 台、闲置 30 分钟自动休眠、归档/删除会话自动清理
 
 ## 文件说明
 
@@ -44,7 +45,7 @@ DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 
 ```bash
 # 下载地址：https://github.com/GHJIVHIDD/dsh-plugin-vm-sandbox/releases
-dsh plugin --profile web add ./dsh-plugin-vm-sandbox-0.0.2.tgz
+dsh plugin --profile web add ./dsh-plugin-vm-sandbox-0.0.3.tgz
 ```
 
 因为本插件同时带有 `dsh.bundle` 声明，`dsh plugin` 会自动把它加入 profile 的 `bundles` 层，并应用 `cordis.patch.yml` 自动插入虚拟机页签。
@@ -61,7 +62,19 @@ dsh --profile web
 
 ## 更新内容
 
-### v0.0.2（最新）
+### v0.0.3（最新）
+
+- 同一会话可创建多台虚拟机（必要时）：
+  - `vm_create` 每次调用创建一台新机器，可用 `machine` 参数指定名称（仅小写字母/数字，≤8 位，缺省自动生成）
+  - `vm_exec` 省略 `machine` 时复用本会话默认（最近使用）机器，仅在没有任何机器时自动创建，避免重复建机
+  - `vm_delete` 增加 `machine` 参数，可删除本会话指定机器；省略时删除默认机器
+- 全局运行上限从 5 台提升至 **25 台**；新增每会话上限 8 台（防磁盘耗尽，可在配置常量中调整）
+- 跨会话使用：`vm_exec` / `vm_create` 传入其他会话的机器名称时可直接使用（必要情况下跨会话），返回结果带 `ownerSession` / `crossSession` 标识；删除仍仅限归属会话
+- 「虚拟机」页签新增「＋ Debian / ＋ Alpine」一键新建按钮，头部展示总台数、运行数、上限与「本会话 N 台」
+- 状态文件 `~/.dsh/vm-sandbox/state.json` 迁移为按会话多台记录（旧单台记录自动兼容迁移）
+- 新增 Host 接口：`GET /vmsb-api/create?session=<id>&distro=<debian|alpine>`（异步创建，立即返回）
+
+### v0.0.2
 
 - 新增虚拟机 Shell 实时执行记录：
   - 记录 `vm_exec` 执行的命令、开始/结束时间、耗时、退出码、stdout/stderr 和运行状态
@@ -77,4 +90,4 @@ dsh --profile web
 - 面向 DeepSeek Harness `web` profile
 - 需要 Web 端已启用 `@deepseek-ai/dsh-client-runtime` 与 `@deepseek-ai/dsh-client-ui-conversation`（标准 web profile 自带）
 - 宿主机需要安装并运行 OrbStack，`orb` 命令位于 `/usr/local/bin/orb`
-- 插件版本：0.0.2
+- 插件版本：0.0.3
