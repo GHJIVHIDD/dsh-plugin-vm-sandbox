@@ -354,11 +354,15 @@ window.__ModuleLoader__.load({
 
 			const machines = data ? data.machines : null;
 			const own = data ? data.own : null;
-			const ownNames = new Set((own || []).map((o) => o.name));
+			// v0.0.3 host 返回 own 为数组;旧版宿主返回单条对象或 null,按空数组处理,保持兼容
+			const ownList = Array.isArray(own) ? own : [];
+			const ownNames = new Set(ownList.map((o) => o.name));
+			// 仅当宿主为 v0.0.3+(返回 cap 字段)时才显示新建等新能力,避免旧宿主 404
+			const canCreate = !!(data && typeof data.cap === "number");
 			const runningCount = machines ? machines.filter((m) => m.state === "running").length : 0;
 
 			const rows = machines === null ? null : machines.length === 0
-				? React.createElement("div", { className: "vmsb-muted" }, "当前没有 OrbStack 虚拟机。点击上方「＋ Debian / ＋ Alpine」新建,或由会话智能体通过 vm_exec / vm_create 创建沙箱。")
+				? React.createElement("div", { className: "vmsb-muted" }, "当前没有 OrbStack 虚拟机。可新建(debian/alpine),或由会话智能体通过 vm_exec / vm_create 创建沙箱。")
 				: React.createElement("div", { className: "vmsb-list" }, machines.map((m) => {
 					const isOwn = m.ownedByThis || ownNames.has(m.name);
 					const busyName = busy[m.name];
@@ -389,9 +393,13 @@ window.__ModuleLoader__.load({
 			return React.createElement("div", { className: "vmsb-panel" },
 				React.createElement("div", { className: "vmsb-head" },
 					React.createElement("span", { className: "vmsb-title" }, "虚拟机沙箱 (OrbStack)"),
-					React.createElement("span", { className: "vmsb-count" }, machines === null ? "" : "共 " + machines.length + " 台 · 运行 " + runningCount + (data && data.cap ? " · 上限 " + data.cap : "") + (own && own.length ? " · 本会话 " + own.length + " 台" : "")),
-					React.createElement("button", { className: "vmsb-btn", disabled: !!creating, onClick: () => onCreate("debian") }, creating === "debian" ? "创建中…" : "＋ Debian"),
-					React.createElement("button", { className: "vmsb-btn", disabled: !!creating, onClick: () => onCreate("alpine") }, creating === "alpine" ? "创建中…" : "＋ Alpine"),
+					React.createElement("span", { className: "vmsb-count" }, machines === null ? "" : "共 " + machines.length + " 台 · 运行 " + runningCount + (data && data.cap ? " · 上限 " + data.cap : "") + (ownList.length ? " · 本会话 " + ownList.length + " 台" : "")),
+					canCreate
+						? React.createElement("button", { className: "vmsb-btn", disabled: !!creating, onClick: () => onCreate("debian") }, creating === "debian" ? "创建中…" : "＋ Debian")
+						: null,
+					canCreate
+						? React.createElement("button", { className: "vmsb-btn", disabled: !!creating, onClick: () => onCreate("alpine") }, creating === "alpine" ? "创建中…" : "＋ Alpine")
+						: null,
 					React.createElement("button", { className: "vmsb-btn", onClick: refreshList }, "刷新"),
 				),
 				error ? React.createElement("div", { className: "vmsb-error" }, error) : null,
