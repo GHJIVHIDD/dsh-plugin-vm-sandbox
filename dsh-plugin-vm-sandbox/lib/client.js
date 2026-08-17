@@ -213,6 +213,7 @@ const [tab, setTab] = React.useState("vms");
 			const [jobRows, setJobRows] = React.useState(null);
 			const [audits, setAudits] = React.useState(null);
 			const [meta, setMeta] = React.useState(null);
+const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "" });
 			const loadTab = React.useCallback((t) => {
 				setTab(t);
 				setError(null);
@@ -231,13 +232,27 @@ const [tab, setTab] = React.useState("vms");
 					]).then(async ([svc, cron, tpl, pol]) => {
 						const machines = svc.machines || [];
 						const metrics = {};
+						const net = {};
+						const shares = {};
 						await Promise.allSettled(machines.slice(0, 5).map(async (m) => {
 							try {
 								const r = await api("metrics", { machine: m.name, limit: 30 });
 								metrics[m.name] = r.metrics || [];
 							} catch (e) { /* ignore */ }
 						}));
-						setMeta({ svc: machines, cron: cron.jobs || [], tpl: tpl.templates || [], pol: pol.policy, metrics });
+						await Promise.allSettled(machines.map(async (m) => {
+							try {
+								const r = await api("network", { machine: m.name });
+								if (r && r.ok) net[m.name] = r.policy || {};
+							} catch (e) { /* ignore */ }
+						}));
+						await Promise.allSettled(machines.map(async (m) => {
+							try {
+								const r = await api("share", { machine: m.name });
+								if (r && r.ok) shares[m.name] = r.sharedWith || [];
+							} catch (e) { /* ignore */ }
+						}));
+						setMeta({ svc: machines, cron: cron.jobs || [], tpl: tpl.templates || [], pol: pol.policy, metrics, net, shares });
 					}, (e) => setError(String((e && e.message) || e)));
 				}
 			}, [sessionId]);
@@ -483,22 +498,39 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 				if (tab === "jobs") {
 					if (!jobRows) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
 					if (jobRows.length === 0) return React.createElement("div", { className: "vmsb-muted" }, "暂无后台任务。");
-					return React.createElement("div", { className: "vmsb-list" }, jobRows.map((j) => React.createElement("div", { key: j.id, className: "vmsb-item" },
-						React.createElement("div", { className: "vmsb-row" },
-							React.createElement("span", { className: "vmsb-name" }, j.id),
-							React.createElement("span", { className: "vmsb-meta" }, (j.machine || "") + " · " + (j.status || "")),
-							React.createElement("span", { className: "vmsb-owner" }, (j.command || "").slice(0, 60)),
-							panelButton(() => api("tunnels", {}).then(() => { api("jobs", { session: sessionId }).then((r) => setJobRows(r.jobs || [])); }, () => {}), "刷新"),
-						),
-					)));
+					const reloadJobs = () => api("jobs", { session: sessionId }).then((r) => setJobRows(r.jobs || []), (e) => setError(String((e && e.message) || e)));
+					return React.createElement("div", null,
+						React.createElement("div", { style: { marginBottom: 8 } }, panelButton(reloadJobs, "刷新")),
+						React.createElement("div", { className: "vmsb-list" }, jobRows.map((j) => React.createElement("div", { key: j.id, className: "vmsb-item" },
+							React.createElement("div", { className: "vmsb-row" },
+								React.createElement("span", { className: "vmsb-name" }, j.id),
+								React.createElement("span", { className: "vmsb-meta" }, (j.machine || "") + " · " + (j.status || "")),
+								React.createElement("span", { className: "vmsb-owner" }, (j.command || "").slice(0, 60)),
+								j.status === "running"
+									? panelButton(() => { api("job", { action: "stop", id: j.id, session: sessionId }).then(reloadJobs, (e) => setError(String((e && e.message) || e))); }, "停止", true)
+									: null,
+								panelButton(() => { api("job", { action: "output", id: j.id, session: sessionId }).then((r) => setError(String(JSON.stringify(r.log || "")).slice(0, 500)), (e) => setError(String((e && e.message) || e))); }, "日志"),
+							),
+						))),
+					);
 				}
 				if (tab === "audit") {
 					if (!audits) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
 					if (audits.length === 0) return React.createElement("div", { className: "vmsb-muted" }, "暂无审计记录。");
+					const applyFilter = () => {
+						const params = { session: sessionId, limit: 200 };
+						if (auditFilter.machine) params.machine = auditFilter.machine;
+						if (auditFilter.operation) params.operation = auditFilter.operation;
+						api("audit", params).then((r) => setAudits(r.entries || []), (e) => setError(String((e && e.message) || e)));
+					};
+					const input = (key, ph) => React.createElement("input", { placeholder: ph, value: auditFilter[key], onChange: (e) => setAuditFilter(Object.assign({}, auditFilter, { [key]: e.target.value })), style: { marginRight: 6, padding: "3px 8px", borderRadius: 6, border: "1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.3))", background: "transparent", color: "inherit", fontSize: 12 } });
 					const toCSV = () => download("vmsb-audit.csv", "ts,operation,machine,sessionId,ok,error\n" + audits.map((a) => [a.ts, a.operation, a.machine, a.sessionId, a.ok ? 1 : 0, (a.error || "").replace(/,/g, " ")].join(",")).join("\n"));
 					const toJSON = () => download("vmsb-audit.json", JSON.stringify(audits, null, 2));
 					return React.createElement("div", null,
 						React.createElement("div", { style: { marginBottom: 8 } },
+							input("machine", "过滤机器"),
+							input("operation", "过滤操作"),
+							panelButton(applyFilter, "筛选"),
 							panelButton(toCSV, "导出 CSV"),
 							panelButton(toJSON, "导出 JSON"),
 						),
@@ -527,8 +559,25 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 								mem.slice(-30).map((v, i) => React.createElement("div", { key: i, style: { width: 6, height: Math.max(2, Math.round(v * 40)), background: "var(--dsw-alias-brand-primary, #6e8cff)" } }))),
 						);
 					});
+					const reloadMeta = () => loadTab("meta");
+					const netRows = (meta.svc || []).map((m) => {
+						const p = (meta.net || {})[m.name] || {};
+						const sh = (meta.shares || {})[m.name] || [];
+						const toggle = (key) => api("network", { session: sessionId, machine: m.name, [key]: p[key] === false ? 1 : 0 }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+						return React.createElement("div", { key: "net-" + m.name, className: "vmsb-item" },
+							React.createElement("div", { className: "vmsb-row" },
+								React.createElement("span", { className: "vmsb-name" }, m.name),
+								React.createElement("span", { className: "vmsb-meta" }, "公网:" + (p.publicAccess === false ? "关" : "开") + " · 内网:" + (p.internalAccess === false ? "关" : "开")),
+								React.createElement("span", { className: "vmsb-owner" }, "共享 " + sh.length + " 个"),
+								panelButton(() => toggle("public_access"), p.publicAccess === false ? "开公网" : "关公网"),
+								panelButton(() => toggle("internal_access"), p.internalAccess === false ? "开内网" : "关内网"),
+							),
+						);
+					});
 					return React.createElement("div", { className: "vmsb-list" },
 						items.map((t, i) => React.createElement("div", { key: i, className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, t)))),
+						netRows.length ? React.createElement("div", { key: "netheader", className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, "网络开关"))) : null,
+						...netRows,
 						metricBars.length ? React.createElement("div", { key: "metrics", className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, "指标趋势(内存使用率)"))) : null,
 						...metricBars,
 					);

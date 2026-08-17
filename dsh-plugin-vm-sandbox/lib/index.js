@@ -1852,6 +1852,74 @@ route('/vmsb-api/snapshots', async (req, res) => {
           sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
         }
       })
+route('/vmsb-api/network', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          const machine = q.get('machine') || ''
+          const hasSet = q.get('public_access') !== null || q.get('internal_access') !== null || q.get('isolated') !== null || q.get('isolate_network') !== null || q.get('allowlist') !== null
+          if (!machine) throw new Error('缺少机器名称')
+          if (hasSet) {
+            const parseB = (v) => v === null ? undefined : (v === '1' || v === 'true')
+            const allow = q.get('allowlist') ? q.get('allowlist').split(',').map((x) => x.trim()).filter(Boolean) : undefined
+            sendJson(res, 200, await setNetworkPolicy(ctx, sessionId, machine, parseB(q.get('public_access')), parseB(q.get('internal_access')), parseB(q.get('isolated')), parseB(q.get('isolate_network')), allow))
+          } else {
+            sendJson(res, 200, await networkStatusOf(ctx, sessionId, machine))
+          }
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/share', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          const machine = q.get('machine') || ''
+          const target = q.get('session_target') || ''
+          const mode = q.get('mode') || 'exec'
+          const action = q.get('action') || 'list'
+          if (!machine) throw new Error('缺少机器名称')
+          if (action === 'add') {
+            if (!sessionId || !target) throw new Error('缺少 session/session_target')
+            if (!canOwner(sessionId, machine)) throw new Error('只有归属会话可以共享')
+            const grants = state.shares[machine] = state.shares[machine] || []
+            const idx = grants.findIndex((g) => g.sessionId === target)
+            if (idx >= 0) grants[idx] = { sessionId: target, mode, sharedAt: Date.now() }
+            else grants.push({ sessionId: target, mode, sharedAt: Date.now() })
+            saveState()
+          } else if (action === 'remove') {
+            if (!target) throw new Error('缺少 session_target')
+            const grants = state.shares[machine] = (state.shares[machine] || []).filter((g) => g.sessionId !== target)
+            if (grants.length === 0) delete state.shares[machine]
+            saveState()
+          }
+          sendJson(res, 200, { ok: true, machine, sharedWith: state.shares[machine] || [] })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/job', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          const id = q.get('id') || ''
+          const action = q.get('action') || 'list'
+          if (id && action === 'stop') {
+            sendJson(res, 200, await stopJob(ctx, sessionId, id))
+          } else if (id && action === 'rotate') {
+            const job = jobById(id)
+            if (!job) throw new Error('未找到后台任务')
+            sendJson(res, 200, await jobLogRotate(id))
+          } else if (id && action === 'output') {
+            sendJson(res, 200, await jobFullOutput(id, q.get('max_bytes')))
+          } else {
+            const list = (state.jobs || []).filter((j) => !sessionId || j.sessionId === sessionId).reverse().slice(0, Number(q.get('limit')) || 200)
+            sendJson(res, 200, { ok: true, jobs: list })
+          }
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
   }
 // ---------- 模型工具 ----------
   if (tools) {
