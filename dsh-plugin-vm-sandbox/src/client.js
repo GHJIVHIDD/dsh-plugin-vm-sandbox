@@ -484,16 +484,24 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 				if (tab === "vms") return rows;
 				if (tab === "snap") {
 					if (!snaps) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
-					if (snaps.length === 0) return React.createElement("div", { className: "vmsb-muted" }, "暂无快照。可在虚拟机上用 vm_snapshot 创建，或见 Agent 工具。");
-					return React.createElement("div", { className: "vmsb-list" }, snaps.map((s) => React.createElement("div", { key: s.name, className: "vmsb-item" },
-						React.createElement("div", { className: "vmsb-row" },
-							React.createElement("span", { className: "vmsb-name" }, s.name),
-							React.createElement("span", { className: "vmsb-meta" }, "来自 " + (s.source || "?")),
-							React.createElement("span", { className: "vmsb-owner" }, formatTime(s.createdAt)),
-							panelButton(() => { api("snapshot", { action: "restore", snapshot: s.name, session: sessionId }).then(refreshList, (e) => setError(String((e && e.message) || e))); }, "恢复"),
-							panelButton(() => { api("snapshot", { action: "delete", snapshot: s.name, session: sessionId }).then(() => { loadTab("snap"); }, (e) => setError(String((e && e.message) || e))); }, "删除", true),
+					const defaultMachine = data && data.own && data.own[0] ? data.own[0].name : "";
+					const createSnap = () => { if (!defaultMachine) return; api("snapshot", { action: "create", machine: defaultMachine, session: sessionId }).then(() => loadTab("snap"), (e) => setError(String((e && e.message) || e))); };
+					return React.createElement("div", null,
+						React.createElement("div", { style: { marginBottom: 8 } },
+							panelButton(createSnap, defaultMachine ? "为 " + defaultMachine + " 新建快照" : "无本会话虚拟机可快照"),
+							panelButton(() => loadTab("snap"), "刷新"),
 						),
-					)));
+						React.createElement("div", { className: "vmsb-list" }, (snaps || []).map((s) => React.createElement("div", { key: s.name, className: "vmsb-item" },
+							React.createElement("div", { className: "vmsb-row" },
+								React.createElement("span", { className: "vmsb-name" }, s.name),
+								React.createElement("span", { className: "vmsb-meta" }, "来自 " + (s.source || "?")),
+								React.createElement("span", { className: "vmsb-owner" }, formatTime(s.createdAt)),
+								panelButton(() => { api("snapshot", { action: "restore", snapshot: s.name, session: sessionId }).then(refreshList, (e) => setError(String((e && e.message) || e))); }, "恢复"),
+								panelButton(() => { api("snapshot", { action: "delete", snapshot: s.name, session: sessionId }).then(() => { loadTab("snap"); }, (e) => setError(String((e && e.message) || e))); }, "删除", true),
+							),
+						))),
+						snaps.length === 0 ? React.createElement("div", { className: "vmsb-muted" }, "暂无快照。") : null,
+					);
 				}
 				if (tab === "jobs") {
 					if (!jobRows) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
@@ -563,14 +571,24 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 					const netRows = (meta.svc || []).map((m) => {
 						const p = (meta.net || {})[m.name] || {};
 						const sh = (meta.shares || {})[m.name] || [];
+						const owned = data && data.own && data.own.some((o) => o.name === m.name);
 						const toggle = (key) => api("network", { session: sessionId, machine: m.name, [key]: p[key] === false ? 1 : 0 }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+						const removeShare = (sid) => api("share", { action: "remove", machine: m.name, session_target: sid, session: sessionId }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+						const addShare = () => {
+							const sid = window.prompt("目标会话 ID");
+							if (!sid) return;
+							const mode = window.prompt("权限模式(exec/manage)", "exec");
+							api("share", { action: "add", machine: m.name, session_target: sid, mode: mode || "exec", session: sessionId }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+						};
 						return React.createElement("div", { key: "net-" + m.name, className: "vmsb-item" },
 							React.createElement("div", { className: "vmsb-row" },
 								React.createElement("span", { className: "vmsb-name" }, m.name),
 								React.createElement("span", { className: "vmsb-meta" }, "公网:" + (p.publicAccess === false ? "关" : "开") + " · 内网:" + (p.internalAccess === false ? "关" : "开")),
-								React.createElement("span", { className: "vmsb-owner" }, "共享 " + sh.length + " 个"),
+								React.createElement("span", { className: "vmsb-owner" }, "共享:" + (sh.map((s) => s.sessionId + "(" + s.mode + ")").join(",") || "无")),
 								panelButton(() => toggle("public_access"), p.publicAccess === false ? "开公网" : "关公网"),
 								panelButton(() => toggle("internal_access"), p.internalAccess === false ? "开内网" : "关内网"),
+								owned ? panelButton(addShare, "添加共享") : null,
+								owned ? sh.map((s) => panelButton(() => removeShare(s.sessionId), "移除 " + s.sessionId.slice(0, 8), true)) : [],
 							),
 						);
 					});
