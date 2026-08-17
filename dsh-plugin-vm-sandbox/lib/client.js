@@ -228,7 +228,17 @@ const [tab, setTab] = React.useState("vms");
 						api("cron", { session: sessionId }),
 						api("templates", {}),
 						api("policy", { session: sessionId }),
-					]).then(([svc, cron, tpl, pol]) => setMeta({ svc: svc.machines || [], cron: cron.jobs || [], tpl: tpl.templates || [], pol: pol.policy }), (e) => setError(String((e && e.message) || e)));
+					]).then(async ([svc, cron, tpl, pol]) => {
+						const machines = svc.machines || [];
+						const metrics = {};
+						await Promise.allSettled(machines.slice(0, 5).map(async (m) => {
+							try {
+								const r = await api("metrics", { machine: m.name, limit: 30 });
+								metrics[m.name] = r.metrics || [];
+							} catch (e) { /* ignore */ }
+						}));
+						setMeta({ svc: machines, cron: cron.jobs || [], tpl: tpl.templates || [], pol: pol.policy, metrics });
+					}, (e) => setError(String((e && e.message) || e)));
 				}
 			}, [sessionId]);
 
@@ -509,7 +519,19 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 						"定时任务: " + (meta.cron || []).length + " 个",
 						"服务: " + (meta.svc || []).map((m) => (m.name || "") + "@" + (m.ip4 || "?")).join("  ") || "无",
 					];
-					return React.createElement("div", { className: "vmsb-list" }, items.map((t, i) => React.createElement("div", { key: i, className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, t)))));
+					const metricBars = Object.entries(meta.metrics || {}).map(([name, list]) => {
+						const mem = (list || []).map((p) => p.memory && p.memory.totalBytes ? 1 - (p.memory.availableBytes / p.memory.totalBytes) : 0);
+						return React.createElement("div", { key: name, className: "vmsb-item" },
+							React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-name" }, name), React.createElement("span", { className: "vmsb-meta" }, "内存使用率")),
+							React.createElement("div", { style: { display: "flex", alignItems: "flex-end", gap: 2, height: 40, padding: "4px 8px" } },
+								mem.slice(-30).map((v, i) => React.createElement("div", { key: i, style: { width: 6, height: Math.max(2, Math.round(v * 40)), background: "var(--dsw-alias-brand-primary, #6e8cff)" } }))),
+						);
+					});
+					return React.createElement("div", { className: "vmsb-list" },
+						items.map((t, i) => React.createElement("div", { key: i, className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, t)))),
+						metricBars.length ? React.createElement("div", { key: "metrics", className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, "指标趋势(内存使用率)"))) : null,
+						...metricBars,
+					);
 				}
 				return rows;
 			};
