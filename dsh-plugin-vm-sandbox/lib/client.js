@@ -197,6 +197,29 @@ window.__ModuleLoader__.load({
 			const [creating, setCreating] = React.useState(null);
 			// 正在创建的机器(宿主立即返回名字,实际建机约 1-3 分钟):[{ machine, distro, since }]
 			const [pending, setPending] = React.useState([]);
+const [tab, setTab] = React.useState("vms");
+			const [snaps, setSnaps] = React.useState(null);
+			const [jobRows, setJobRows] = React.useState(null);
+			const [audits, setAudits] = React.useState(null);
+			const [meta, setMeta] = React.useState(null);
+			const loadTab = React.useCallback((t) => {
+				setTab(t);
+				setError(null);
+				if (t === "snap") {
+					api("snapshots", { session: sessionId }).then((r) => setSnaps(r.snapshots || []), (e) => setError(String((e && e.message) || e)));
+				} else if (t === "jobs") {
+					api("jobs", { session: sessionId }).then((r) => setJobRows(r.jobs || []), (e) => setError(String((e && e.message) || e)));
+				} else if (t === "audit") {
+					api("audit", { session: sessionId, limit: 200 }).then((r) => setAudits(r.entries || []), (e) => setError(String((e && e.message) || e)));
+				} else if (t === "meta") {
+					Promise.all([
+						api("services", { session: sessionId }),
+						api("cron", { session: sessionId }),
+						api("templates", {}),
+						api("policy", { session: sessionId }),
+					]).then(([svc, cron, tpl, pol]) => setMeta({ svc: svc.machines || [], cron: cron.jobs || [], tpl: tpl.templates || [], pol: pol.policy }), (e) => setError(String((e && e.message) || e)));
+				}
+			}, [sessionId]);
 
 			const refreshList = React.useCallback(() => {
 				api("list", { session: sessionId }).then(
@@ -420,6 +443,57 @@ window.__ModuleLoader__.load({
 						),
 					)),
 				);
+const panelButton = (onClick, label, danger) => React.createElement("button", { className: "vmsb-btn" + (danger ? " vmsb-danger" : ""), onClick, style: { marginLeft: 6 } }, label);
+			const renderTab = () => {
+				if (tab === "vms") return rows;
+				if (tab === "snap") {
+					if (!snaps) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
+					if (snaps.length === 0) return React.createElement("div", { className: "vmsb-muted" }, "暂无快照。可在虚拟机上用 vm_snapshot 创建，或见 Agent 工具。");
+					return React.createElement("div", { className: "vmsb-list" }, snaps.map((s) => React.createElement("div", { key: s.name, className: "vmsb-item" },
+						React.createElement("div", { className: "vmsb-row" },
+							React.createElement("span", { className: "vmsb-name" }, s.name),
+							React.createElement("span", { className: "vmsb-meta" }, "来自 " + (s.source || "?")),
+							React.createElement("span", { className: "vmsb-owner" }, formatTime(s.createdAt)),
+							panelButton(() => { api("snapshot", { action: "restore", snapshot: s.name, session: sessionId }).then(refreshList, (e) => setError(String((e && e.message) || e))); }, "恢复"),
+							panelButton(() => { api("snapshot", { action: "delete", snapshot: s.name, session: sessionId }).then(() => { loadTab("snap"); }, (e) => setError(String((e && e.message) || e))); }, "删除", true),
+						),
+					)));
+				}
+				if (tab === "jobs") {
+					if (!jobRows) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
+					if (jobRows.length === 0) return React.createElement("div", { className: "vmsb-muted" }, "暂无后台任务。");
+					return React.createElement("div", { className: "vmsb-list" }, jobRows.map((j) => React.createElement("div", { key: j.id, className: "vmsb-item" },
+						React.createElement("div", { className: "vmsb-row" },
+							React.createElement("span", { className: "vmsb-name" }, j.id),
+							React.createElement("span", { className: "vmsb-meta" }, (j.machine || "") + " · " + (j.status || "")),
+							React.createElement("span", { className: "vmsb-owner" }, (j.command || "").slice(0, 60)),
+							panelButton(() => api("tunnels", {}).then(() => { api("jobs", { session: sessionId }).then((r) => setJobRows(r.jobs || [])); }, () => {}), "刷新"),
+						),
+					)));
+				}
+				if (tab === "audit") {
+					if (!audits) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
+					if (audits.length === 0) return React.createElement("div", { className: "vmsb-muted" }, "暂无审计记录。");
+					return React.createElement("div", { className: "vmsb-list" }, audits.map((a) => React.createElement("div", { key: a.id, className: "vmsb-item" },
+						React.createElement("div", { className: "vmsb-row" },
+							React.createElement("span", { className: "vmsb-name" }, a.operation || ""),
+							React.createElement("span", { className: "vmsb-meta" }, (a.machine || "—") + " · " + (a.ok ? "成功" : "失败")),
+							React.createElement("span", { className: "vmsb-owner" }, formatTime(a.ts) + " · " + (a.sessionId || "")),
+						),
+					)));
+				}
+				if (tab === "meta") {
+					if (!meta) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
+					const items = [
+						"策略: " + JSON.stringify(meta.pol || {}),
+						"模板: " + (meta.tpl || []).map((t) => t.name).join(", ") || "无",
+						"定时任务: " + (meta.cron || []).length + " 个",
+						"服务: " + (meta.svc || []).map((m) => (m.name || "") + "@" + (m.ip4 || "?")).join("  ") || "无",
+					];
+					return React.createElement("div", { className: "vmsb-list" }, items.map((t, i) => React.createElement("div", { key: i, className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, t)))));
+				}
+				return rows;
+			};
 
 			return React.createElement("div", { className: "vmsb-panel" },
 				React.createElement("div", { className: "vmsb-head" },
@@ -433,8 +507,12 @@ window.__ModuleLoader__.load({
 						: null,
 					React.createElement("button", { className: "vmsb-btn", onClick: refreshList }, "刷新"),
 				),
+				React.createElement("div", { className: "vmsb-tabs", style: { display: "flex", gap: 6, marginBottom: 10 } },
+					[["vms", "虚拟机"], ["snap", "快照"], ["jobs", "任务"], ["audit", "审计"], ["meta", "网络/共享"]].map(([k, label]) =>
+						React.createElement("button", { key: k, className: "vmsb-btn", style: tab === k ? { background: "var(--dsw-alias-bg-layer-1, rgba(110,140,255,.18))" } : undefined, onClick: () => loadTab(k) }, label)),
+				),
 				error ? React.createElement("div", { className: "vmsb-error" }, error) : null,
-				machines === null ? React.createElement("div", { className: "vmsb-muted" }, "加载中…") : rows,
+				tab === "vms" ? (machines === null ? React.createElement("div", { className: "vmsb-muted" }, "加载中…") : rows) : renderTab(),
 			);
 		}
 

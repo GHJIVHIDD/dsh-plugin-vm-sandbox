@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
-  "version": "0.1.0",
-  "description": "OrbStack VM sandbox: full VM plugin with snapshots/restore, upload/download, lifecycle (start/stop/restart/status), port forwarding, background jobs, audit, sharing/permissions/reclamation, network policy, custom resources, cloud-init init scripts, parallel vm_exec and rich status.",
+  "version": "0.2.0",
+  "description": "OrbStack VM sandbox v0.2.0: web UI tabs (snapshots/jobs/audit/network), cron tasks, auto snapshot policies, template library, hot resize, export/import, metrics history, multi-machine groups/fail-fast, network allowlist and service discovery.",
   "type": "module",
   "scripts": {
     "prepare": "node ./scripts/prepare.mjs",

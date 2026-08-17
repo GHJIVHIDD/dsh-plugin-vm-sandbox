@@ -24,7 +24,7 @@ const webServer = { register() { return () => {} } }
 const ctx = {
   get(key) { if (key === 'tools') return tools; if (key === 'webServer') return webServer; return null },
   on() {},
-  effect(fn, key) { if (key && key.startsWith('vmsb: idle')) return; return fn() },
+  effect(fn, key) { if (key && (key.startsWith('vmsb: idle') || key.startsWith('vmsb: cron') || key.startsWith('vmsb: metrics'))) return; return fn() },
 }
 apply(ctx)
 

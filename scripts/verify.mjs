@@ -30,7 +30,7 @@ const ctx = {
   on() {},
   effect(fn, key) {
     // Do not start real interval sweeps during verification.
-    if (key && key.startsWith('vmsb: idle')) return
+    if (key && (key.startsWith('vmsb: idle') || key.startsWith('vmsb: cron') || key.startsWith('vmsb: metrics'))) return
     return fn()
   },
 }
@@ -45,6 +45,8 @@ const requiredTools = [
   'vm_port_forward', 'vm_port_forward_list', 'vm_port_forward_stop',
   'vm_job_submit', 'vm_job_list', 'vm_job_status', 'vm_job_stop', 'vm_job_output',
   'vm_audit', 'vm_share', 'vm_unshare', 'vm_policy', 'vm_network',
+  'vm_cron', 'vm_template', 'vm_resize', 'vm_metrics', 'vm_export', 'vm_import',
+  'vm_service_discover', 'vm_service_register',
 ]
 
 const missing = requiredTools.filter((name) => !toolsMap[name])
@@ -54,8 +56,8 @@ if (missing.length) {
 }
 
 const requiredParams = {
-  vm_create: ['cpus', 'memory', 'disk', 'init_script', 'cloud_init', 'isolated', 'isolate_network'],
-  vm_exec: ['machines'],
+  vm_create: ['cpus', 'memory', 'disk', 'init_script', 'cloud_init', 'isolated', 'isolate_network', 'template'],
+  vm_exec: ['machines', 'groups', 'strategy'],
   vm_snapshot: ['machine', 'note'],
   vm_restore: ['snapshot'],
   vm_snapshot_delete: ['snapshot'],
@@ -68,7 +70,16 @@ const requiredParams = {
   vm_audit: ['machine', 'operation', 'limit'],
   vm_share: ['machine', 'session', 'mode'],
   vm_network: ['public_access', 'internal_access', 'isolated', 'isolate_network'],
-  vm_policy: ['max_machines', 'idle_sleep_minutes', 'idle_delete_days'],
+  vm_policy: ['max_machines', 'idle_sleep_minutes', 'idle_delete_days', 'snapshot_interval_hours', 'snapshot_retention'],
+  vm_cron: ['operation', 'machine', 'command', 'expr'],
+  vm_template: ['operation', 'name', 'init_script', 'cloud_init'],
+  vm_resize: ['machine', 'cpus', 'memory', 'disk'],
+  vm_metrics: ['machine', 'limit'],
+  vm_export: ['machine', 'output_path'],
+  vm_import: ['machine', 'input_path'],
+  vm_service_discover: ['machine'],
+  vm_service_register: ['machine', 'service'],
+  vm_network: ['public_access', 'internal_access', 'isolated', 'isolate_network', 'allowlist'],
 }
 
 const failures = []

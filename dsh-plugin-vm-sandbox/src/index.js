@@ -1,7 +1,7 @@
 /**
  * Host loader entry for the deployment-level VM sandbox plugin.
  *
- * v0.1.0 upgrade — implements the full VM plugin feature set:
+ * v0.2.0 upgrade — adds Web UI tabs, cron, auto snapshots, templates, resize, export/import, metrics, groups/fail-fast, network allowlist and service discovery:
  *   1. 快照与回滚 vm_snapshot / vm_restore / vm_snapshot_delete / vm_snapshot_list
  *   2. 文件传输 vm_upload / vm_download (OrbStack official orb push/pull)
  *   3. 生命周期管理 vm_start / vm_stop / vm_restart / vm_status
@@ -48,6 +48,10 @@ const IDLE_SWEEP_MS = 5 * 60 * 1000
 const CREATE_ARGS = ['--cpus', '2', '--memory', '2G', '--disk', '16G']
 const VM_JOBS_DIR = '/root/.dsh/jobs'
 const SHELL_LOG_LIMIT = 200
+const CRON_INTERVAL_MS = 30 * 1000
+const METRICS_INTERVAL_MS = 30 * 1000
+const MAX_METRICS_POINTS = 1440
+const TEMPLATE_FILE = join(STATE_DIR, 'templates.json')
 // ---------- 状态持久化 ----------
 // machines[sessionId] = [{name,distro,createdAt,lastUsedAt,spec,createdWith}]
 // snapshots[name] = {name,source,distro,sessionId,createdAt,note}
@@ -85,10 +89,14 @@ function loadStateFile() {
         jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
         tunnels: Array.isArray(parsed.tunnels) ? parsed.tunnels : [],
         audit: Array.isArray(parsed.audit) ? parsed.audit : [],
+        cron: Array.isArray(parsed.cron) ? parsed.cron : [],
+        templates: parsed.templates && typeof parsed.templates === 'object' ? parsed.templates : {},
+        metrics: parsed.metrics && typeof parsed.metrics === 'object' ? parsed.metrics : {},
+        services: parsed.services && typeof parsed.services === 'object' ? parsed.services : {},
       }
     }
   } catch (e) { /* 缺失或损坏时使用空状态 */ }
-  return { version: 3, machines: {}, snapshots: {}, shares: {}, policies: {}, network: {}, jobs: [], tunnels: [], audit: [] }
+  return { version: 4, machines: {}, snapshots: {}, shares: {}, policies: {}, network: {}, jobs: [], tunnels: [], audit: [], cron: [], templates: {}, metrics: {}, services: {} }
 }
 let state = loadStateFile()
 let knownArchived = new Set()
@@ -289,7 +297,7 @@ function touchMachine(sessionId, name) {
 // ---------- 权限模型 ----------
 function sessionPolicy(sessionId) {
   return Object.assign(
-    { maxMachines: MAX_PER_SESSION, idleSleepMinutes: 30, idleDeleteDays: 0 },
+    { maxMachines: MAX_PER_SESSION, idleSleepMinutes: 30, idleDeleteDays: 0, snapshotIntervalHours: 0, snapshotRetention: 0 },
     (state.policies && state.policies[sessionId]) || {},
   )
 }
@@ -1034,6 +1042,108 @@ async function jobFullOutput(jobId, maxBytes) {
   const res = await orb(['run', '-m', job.machine, '-u', 'root', 'sh', '-lc', 'tail -c ' + limit + ' ' + job.dir + '/out.log 2>/dev/null || true'], { timeoutMs: 30000 })
   return { ok: true, id: job.id, machine: job.machine, command: job.command, log: String(res.stdout || '') }
 }
+// ---------- P1/P2/P3: 定时任务、模板、指标、调整、导入导出、服务发现 ----------
+
+// ---- Cron 定时任务 ----
+function cronPartMatch(value, expr) {
+  const v = Number(value)
+  if (expr === '*' || expr === '*/1') return true
+  if (expr.startsWith('*/')) {
+    const step = Number(expr.slice(2))
+    return step > 0 && v % step === 0
+  }
+  if (expr.includes(',')) return expr.split(',').some((p) => cronPartMatch(v, p.trim()))
+  if (expr.includes('-')) {
+    const [a, b] = expr.split('-').map(Number)
+    return v >= a && v <= b
+  }
+  if (expr.includes('/')) {
+    const [base, step] = expr.split('/')
+    if (base === '*') return v % Number(step) === 0
+    return v % Number(step) === 0 && cronPartMatch(v, base)
+  }
+  return v === Number(expr)
+}
+
+function cronMatch(date, expr) {
+  const parts = String(expr || '').trim().split(/\s+/)
+  if (parts.length !== 5) return false
+  const [minute, hour, day, month, weekday] = parts
+  if (!cronPartMatch(date.getMinutes(), minute)) return false
+  if (!cronPartMatch(date.getHours(), hour)) return false
+  if (!cronPartMatch(date.getDate(), day)) return false
+  if (!cronPartMatch(date.getMonth() + 1, month)) return false
+  if (!cronPartMatch(date.getDay(), weekday)) return false
+  return true
+}
+
+function nextCronRun(expr, fromDate) {
+  const start = new Date(fromDate || Date.now())
+  start.setSeconds(0, 0)
+  start.setMinutes(start.getMinutes() + 1)
+  // 向后扫描 7 天，足以覆盖绝大多数常见表达式
+  const limit = start.getTime() + 7 * 24 * 60 * 60 * 1000
+  const probe = new Date(start)
+  while (probe.getTime() <= limit) {
+    if (cronMatch(probe, expr)) return new Date(probe)
+    probe.setMinutes(probe.getMinutes() + 1)
+  }
+  return null
+}
+
+async function runCronTick(ctx) {
+  const now = new Date()
+  for (const job of state.cron || []) {
+    if (!job.enabled) continue
+    const last = job.lastRunAt ? new Date(job.lastRunAt) : null
+    if (last && now.getTime() - last.getTime() < 60 * 1000) continue
+    if (!cronMatch(now, job.expr)) continue
+    try {
+      const out = await submitJob(ctx, job.sessionId, job.machine, job.command)
+      job.lastRunAt = Date.now()
+      job.nextRunAt = nextCronRun(job.expr, new Date(Date.now() + 1000))?.getTime() || null
+      job.lastJobId = out.job ? out.job.id : null
+      saveState()
+      pushAudit(job.sessionId, job.machine, 'vm_cron_run', { cronId: job.id, jobId: job.lastJobId }, true, null)
+    } catch (e) {
+      pushAudit(job.sessionId, job.machine, 'vm_cron_run', { cronId: job.id }, false, e && e.message || e)
+    }
+  }
+}
+
+async function autoSnapshotTick(ctx) {
+  const now = Date.now()
+  for (const sid of Object.keys(state.machines)) {
+    const policy = sessionPolicy(sid)
+    const interval = Number(policy.snapshotIntervalHours || 0)
+    const retention = Number(policy.snapshotRetention || 0)
+    if (!(interval > 0)) continue
+    for (const rec of sessionMachines(sid)) {
+      const key = rec.name
+      const last = rec.lastSnapshotAt || rec.createdAt || 0
+      if (now - last < interval * 3600 * 1000) continue
+      try {
+        const out = await createSnapshot(ctx, sid, rec.name, 'auto-snapshot')
+        rec.lastSnapshotAt = Date.now()
+        saveState()
+        if (retention > 0) {
+          const snaps = Object.values(state.snapshots)
+            .filter((s) => s.source === rec.name && s.sessionId === sid)
+            .sort((a, b) => b.createdAt - a.createdAt)
+          const remove = snaps.slice(retention)
+          for (const s of remove) {
+            await orb(['delete', '-f', s.name], { timeoutMs: 180000 })
+            delete state.snapshots[s.name]
+            saveState()
+          }
+        }
+        pushAudit(sid, rec.name, 'auto_snapshot', { snapshot: out.snapshot && out.snapshot.name }, true, null)
+      } catch (e) {
+        pushAudit(sid, rec.name, 'auto_snapshot', {}, false, e && e.message || e)
+      }
+    }
+  }
+}
 // ---------- 端口转发(ssh -N -L, OrbStack 官方 ssh MACHINE@orb) ----------
 function tunnelStartupArgs(machine, bindHost, hostPort, vmPort) {
   return [
@@ -1155,7 +1265,7 @@ function tunnelView() {
 function networkPolicyOf(name) {
   const p = state.network[name]
   if (!p) return null
-  return { publicAccess: p.publicAccess !== false, internalAccess: p.internalAccess !== false, isolated: !!p.isolated, isolateNetwork: !!p.isolateNetwork, updatedAt: p.updatedAt || 0, appliedAt: p.appliedAt || null }
+  return { publicAccess: p.publicAccess !== false, internalAccess: p.internalAccess !== false, isolated: !!p.isolated, isolateNetwork: !!p.isolateNetwork, allowlist: Array.isArray(p.allowlist) ? p.allowlist : [], updatedAt: p.updatedAt || 0, appliedAt: p.appliedAt || null }
 }
 
 async function ensureNetworkApplied(name) {
@@ -1186,6 +1296,14 @@ async function applyNetworkPolicyToMachine(name) {
     "GW=$(ip route | awk '/default/{print $3; exit}')",
     "[ -n \"$GW\" ] && iptables -A DSH_VM -d \"$GW\" -j RETURN && iptables -A DSH_VM -s \"$GW\" -j RETURN",
   ]
+  for (const item of (p.allowlist || [])) {
+    if (/[a-zA-Z]/.test(item)) {
+      script.push("H=$(getent ahostsv4 " + item + " 2>/dev/null | awk 'NR==1{print $1}'); [ -n \"$H\" ] && iptables -A DSH_VM -d \"$H\" -j RETURN && iptables -A DSH_VM -s \"$H\" -j RETURN")
+    } else {
+      script.push('iptables -A DSH_VM -d ' + item + ' -j RETURN')
+      script.push('iptables -A DSH_VM -s ' + item + ' -j RETURN')
+    }
+  }
   if (!internalAccess) {
     for (const cidr of ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']) {
       script.push('iptables -A DSH_VM -d ' + cidr + ' -j DROP')
@@ -1210,14 +1328,14 @@ async function applyNetworkPolicyToMachine(name) {
   saveState()
 }
 
-async function setNetworkPolicy(ctx, sessionId, machineName, publicAccess, internalAccess, isolated, isolateNetwork) {
+async function setNetworkPolicy(ctx, sessionId, machineName, publicAccess, internalAccess, isolated, isolateNetwork, allowlist) {
   const target = machineName
     ? await resolveExistingMachineByName(ctx, sessionId, machineName)
     : await resolveDefaultMachine(ctx, sessionId)
   if (!canManage(sessionId, target.name)) throw new Error('没有权限修改网络策略(' + target.name + ')')
   const now = Date.now()
   const p = state.network[target.name] = Object.assign(
-    { publicAccess: true, internalAccess: true, isolated: false, isolateNetwork: false },
+    { publicAccess: true, internalAccess: true, isolated: false, isolateNetwork: false, allowlist: [] },
     state.network[target.name] || {},
   )
   if (publicAccess !== undefined) p.publicAccess = !!publicAccess
@@ -1225,6 +1343,7 @@ async function setNetworkPolicy(ctx, sessionId, machineName, publicAccess, inter
   if (isolated !== undefined) p.isolated = !!isolated
   if (isolateNetwork !== undefined) p.isolateNetwork = !!isolateNetwork
   if (p.isolateNetwork) p.isolated = true
+  if (Array.isArray(allowlist)) p.allowlist = allowlist.map((x) => String(x).trim()).filter(Boolean)
   p.updatedAt = now
   p.appliedAt = null
   saveState()
@@ -1442,6 +1561,21 @@ function apply(ctx) {
     }, IDLE_SWEEP_MS)
     return () => clearInterval(timer)
   }, 'vmsb: idle sweep')
+// Cron + 自动快照 + 指标采样
+    ctx.effect(() => {
+      const timer = setInterval(() => {
+        runCronTick(ctx).catch(() => {})
+        autoSnapshotTick(ctx).catch(() => {})
+      }, CRON_INTERVAL_MS)
+      return () => clearInterval(timer)
+    }, 'vmsb: cron/snapshot')
+    ctx.effect(() => {
+      sampleAllMetrics().catch(() => {})
+      const timer = setInterval(() => {
+        sampleAllMetrics().catch(() => {})
+      }, METRICS_INTERVAL_MS)
+      return () => clearInterval(timer)
+    }, 'vmsb: metrics')
 // ---------- HTTP 路由 ----------
   if (webServer) {
     const route = (path, handler) => {
@@ -1626,6 +1760,82 @@ function apply(ctx) {
         sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
       }
     })
+route('/vmsb-api/snapshots', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          const list = listSnapshots().filter((s) => !sessionId || s.sessionId === sessionId)
+          sendJson(res, 200, { ok: true, snapshots: list })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/snapshot', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          const action = q.get('action') || ''
+          const machine = q.get('machine') || ''
+          const snapshot = q.get('snapshot') || ''
+          if (action === 'create') {
+            if (!sessionId) throw new Error('缺少会话标识')
+            sendJson(res, 200, await createSnapshot(ctx, sessionId, machine || (await resolveDefaultMachine(ctx, sessionId)).name, q.get('note') || ''))
+          } else if (action === 'restore') {
+            sendJson(res, 200, await restoreSnapshot(ctx, sessionId, snapshot))
+          } else if (action === 'delete') {
+            sendJson(res, 200, await deleteSnapshot(ctx, sessionId, snapshot))
+          } else {
+            sendJson(res, 200, { ok: true, snapshots: listSnapshots() })
+          }
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/metrics', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const machine = q.get('machine') || ''
+          if (!machine) throw new Error('缺少机器名称')
+          sendJson(res, 200, metricsView(machine, q.get('limit') || 120))
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/cron', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          const list = (state.cron || []).filter((c) => !sessionId || c.sessionId === sessionId)
+          sendJson(res, 200, { ok: true, jobs: list })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/templates', async (req, res) => {
+        try {
+          sendJson(res, 200, { ok: true, templates: templateList() })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/services', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          sendJson(res, 200, await discoverServices(ctx, sessionId, q.get('machine') || ''))
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/policy', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          sendJson(res, 200, { ok: true, sessionId, policy: sessionPolicy(sessionId) })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
   }
 // ---------- 模型工具 ----------
   if (tools) {
@@ -1664,6 +1874,7 @@ function apply(ctx) {
           disk: { type: 'string', description: '可选:磁盘上限,支持 GiB/单位,例如 16G、64G;默认 16G。' },
           init_script: { type: 'string', description: '可选:Shell 初始化脚本(会包装成 cloud-init runcmd,在首次启动时自动执行)。' },
           cloud_init: { type: 'string', description: '可选:完整 cloud-config 用户数据文本(以 #cloud-config 开头),优先于 init_script。' },
+          template: { type: 'string', description: '可选:模板名(python/node/docker/cuda)、本地 JSON/YAML 路径或 GitHub raw URL。内置模板见 vm_template。' },
           isolated: { type: 'boolean', description: '可选:创建隔离机器(关闭文件共享/集成),使用 OrbStack 官方 --isolated。' },
           isolate_network: { type: 'boolean', description: '可选:启用网络隔离(自动附带 --isolated),使用 OrbStack 官方 --isolate-network。' },
         },
@@ -1675,6 +1886,7 @@ function apply(ctx) {
         const t0 = Date.now()
         const distro = args && args.distro === 'alpine' ? 'alpine' : 'debian'
         const hint = sanitizeName(args && args.machine)
+        const template = args && args.template
         const options = {
           cpus: args && args.cpus,
           memory: args && args.memory,
@@ -1683,7 +1895,15 @@ function apply(ctx) {
           cloudInit: args && args.cloud_init,
           isolated: !!(args && args.isolated),
           isolateNetwork: !!(args && args.isolate_network),
+          templateName: template || null,
         }
+        if (template) {
+          const tpl = await resolveTemplate(template)
+          if (tpl && tpl.distro && !(args && args.distro)) options.distro = tpl.distro
+          if (tpl && tpl.init_script && !options.initScript && !options.cloudInit) options.initScript = tpl.init_script
+          if (tpl && tpl.cloud_init && !options.cloudInit && !options.initScript) options.cloudInit = tpl.cloud_init
+        }
+        const templateDistro = options.distro || distro
         try {
           if (hint && ownerOfMachine(hint)) {
             const owner = ownerOfMachine(hint)
@@ -1695,7 +1915,7 @@ function apply(ctx) {
           if (sessionMachines(sessionId).length >= sessionPolicy(sessionId).maxMachines) {
             throw new Error('本会话虚拟机已达上限(' + sessionPolicy(sessionId).maxMachines + ' 台),请先删除不再使用的机器或调整 vm_policy')
           }
-          const rec = await createMachineForSession(ctx, sessionId, distro, exec.signal, hint, options)
+          const rec = await createMachineForSession(ctx, sessionId, templateDistro || distro, exec.signal, hint, options)
           pushAudit(sessionId, rec.name, 'vm_create', { distro, cpus: options.cpus, memory: options.memory, disk: options.disk, init: !!options.initScript, cloudInit: !!options.cloudInit }, true, null, Date.now() - t0)
           return { machine: rec.name, distro: rec.distro, state: rec.state, existing: false, sessionMachines: sessionMachines(sessionId).map((r) => r.name) }
         } catch (err) {
@@ -1713,6 +1933,8 @@ registerTool({
           command: { type: 'string', description: '要在虚拟机内执行的 shell 命令。' },
           machine: { type: 'string', description: '可选:目标机器名称(仅小写字母/数字,<=8 位)。' },
           machines: { type: 'array', items: { type: 'string' }, description: '可选:多台机器名称,并行执行同一命令。' },
+          groups: { type: 'object', description: '可选:按角色/分组顺序执行,如 {"web":["vmA"],"db":["vmB"]}。组内并行,组间按顺序。' },
+          strategy: { type: 'string', enum: ['continue', 'fail-fast'], description: '可选:多机执行策略,默认 continue;fail-fast 遇到失败立即跳过后续组。' },
           distro: { type: 'string', description: '仅当需要新建机器时使用的发行版:debian(默认)或 alpine;目标机器已存在时忽略。', enum: ['debian', 'alpine'] },
           timeout_ms: { type: 'integer', description: '超时毫秒数,默认 600000(10 分钟)。' },
         },
@@ -1780,14 +2002,45 @@ registerTool({
           }
         }
         const t0 = Date.now()
-        const results = await Promise.allSettled(targets.map((t) => execOne(t)))
-        const output = results.map((r) => r.status === 'fulfilled' ? r.value : { machine: r.reason && r.reason.message ? null : null, error: String((r.reason && r.reason.message) || r.reason) })
-        pushAudit(sessionId, names ? names.join(',') : (targets[0] && targets[0].name) || null, 'vm_exec', { command: command.slice(0, 200), multi: names && names.length > 1 }, output.every((o) => o.exitCode === 0), null, Date.now() - t0)
-        if (names && names.length > 1) {
-          const okCount = output.filter((o) => o.exitCode === 0).length
-          return { ok: true, parallel: true, summary: okCount + '/' + output.length + ' 台成功', results: output }
+        const strategy = (args && args.strategy) || 'continue'
+        const groups = args && args.groups && typeof args.groups === 'object' ? args.groups : null
+        const allOutput = []
+        let failed = false
+
+        const runGroup = async (groupTargets) => {
+          const settled = await Promise.allSettled(groupTargets.map((t) => execOne(t)))
+          return settled.map((r) => r.status === 'fulfilled' ? r.value : { machine: r.reason && r.reason.machine ? r.reason.machine : null, error: String((r.reason && r.reason.message) || r.reason) })
         }
-        return output[0]
+
+        if (groups) {
+          for (const [role, machineNames] of Object.entries(groups)) {
+            const groupTargets = []
+            for (const n of Array.from(new Set(Array.isArray(machineNames) ? machineNames : [machineNames])).map(sanitizeName)) {
+              const owner = ownerOfMachine(n)
+              if (owner && !canExec(sessionId, n)) throw new Error('没有权限执行: ' + n + '(请先 vm_share)')
+              groupTargets.push(owner ? await resolveExistingMachineByName(ctx, sessionId, n) : await resolveMachineByName(ctx, sessionId, n, distro, exec.signal))
+            }
+            await Promise.all(groupTargets.map((t) => ensureRunning(t.name)))
+            const out = await runGroup(groupTargets)
+            for (const row of out) row.role = role
+            allOutput.push(...out)
+            if (strategy === 'fail-fast' && out.some((o) => o.exitCode !== 0 || o.error)) {
+              failed = true
+              break
+            }
+          }
+        } else {
+          const results = await Promise.allSettled(targets.map((t) => execOne(t)))
+          const output = results.map((r) => r.status === 'fulfilled' ? r.value : { machine: r.reason && r.reason.machine ? r.reason.machine : null, error: String((r.reason && r.reason.message) || r.reason) })
+          allOutput.push(...output)
+        }
+
+        pushAudit(sessionId, names ? names.join(',') : (targets[0] && targets[0].name) || null, 'vm_exec', { command: command.slice(0, 200), multi: (names && names.length > 1) || !!groups, strategy }, allOutput.every((o) => o.exitCode === 0), null, Date.now() - t0)
+        if (names && names.length > 1 || groups) {
+          const okCount = allOutput.filter((o) => o.exitCode === 0).length
+          return { ok: true, parallel: true, summary: okCount + '/' + allOutput.length + ' 台成功' + (failed ? '（fail-fast 中止）' : ''), strategy, results: allOutput }
+        }
+        return allOutput[0]
       },
     })
 
@@ -2336,6 +2589,8 @@ registerTool({
           max_machines: { type: 'integer', description: '可选设置本会话最大机器数(1-8)。' },
           idle_sleep_minutes: { type: 'integer', description: '可选设置闲置休眠分钟数(0 表示不自动休眠)。' },
           idle_delete_days: { type: 'integer', description: '可选设置闲置自动删除天数(0 表示不自动删除)。' },
+          snapshot_interval_hours: { type: 'integer', description: '可选:自动快照间隔(小时),0 表示关闭。' },
+          snapshot_retention: { type: 'integer', description: '可选:每台机器保留最新快照份数(0 表示不限制)。' },
         },
       },
       output: OUT,
@@ -2347,6 +2602,8 @@ registerTool({
         if (args && args.max_machines !== undefined) next.maxMachines = Math.max(1, Math.min(MAX_PER_SESSION, Number(args.max_machines)))
         if (args && args.idle_sleep_minutes !== undefined) next.idleSleepMinutes = Math.max(0, Number(args.idle_sleep_minutes))
         if (args && args.idle_delete_days !== undefined) next.idleDeleteDays = Math.max(0, Number(args.idle_delete_days))
+        if (args && args.snapshot_interval_hours !== undefined) next.snapshotIntervalHours = Math.max(0, Number(args.snapshot_interval_hours))
+        if (args && args.snapshot_retention !== undefined) next.snapshotRetention = Math.max(0, Number(args.snapshot_retention))
         state.policies[sessionId] = next
         saveState()
         pushAudit(sessionId, null, 'vm_policy', { next }, true, null)
@@ -2365,6 +2622,7 @@ registerTool({
           internal_access: { type: 'boolean', description: '可选:是否允许与其他 VM 内网互通。' },
           isolated: { type: 'boolean', description: '可选:OrbStack 官方隔离模式。' },
           isolate_network: { type: 'boolean', description: '可选:OrbStack 官方网络隔离(需 isolated=true)。' },
+          allowlist: { type: 'array', items: { type: 'string' }, description: '可选:IP/CIDR/域名白名单,即使公网/内网关闭也会放行。' },
         },
       },
       output: OUT,
@@ -2372,16 +2630,493 @@ registerTool({
         const sessionId = sessionIdOf(exec)
         if (!sessionId) throw new Error('无法确定当前会话')
         const machine = sanitizeName(args && args.machine)
-        if (args && (args.public_access !== undefined || args.internal_access !== undefined || args.isolated !== undefined || args.isolate_network !== undefined)) {
-          return setNetworkPolicy(ctx, sessionId, machine, args.public_access, args.internal_access, args.isolated, args.isolate_network)
+        if (args && (args.public_access !== undefined || args.internal_access !== undefined || args.isolated !== undefined || args.isolate_network !== undefined || args.allowlist !== undefined)) {
+          return setNetworkPolicy(ctx, sessionId, machine, args.public_access, args.internal_access, args.isolated, args.isolate_network, args.allowlist)
         }
         return networkStatusOf(ctx, sessionId, machine)
       },
     })
+registerTool({
+      name: 'vm_cron',
+      description: '管理 VM 内定时任务(5 字段 cron 表达式)。operation=list|add|remove|toggle;add 需要 machine/command/expr,支持启停与下次运行时间。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['list', 'add', 'remove', 'toggle', 'run'], description: '操作类型,默认 list。' },
+          name: { type: 'string', description: '任务名称(add/remove/toggle/run 时使用)。' },
+          machine: { type: 'string', description: '目标机器名称(add 时使用)。' },
+          command: { type: 'string', description: '要定时执行的命令(add 时使用)。' },
+          expr: { type: 'string', description: 'cron 表达式(5 字段,如 */5 * * * *)' },
+          enabled: { type: 'boolean', description: '可选:是否启用,默认 true。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const op = (args && args.operation) || 'list'
+        if (op === 'list') {
+          const list = (state.cron || []).filter((c) => c.sessionId === sessionId).map((c) => ({ ...c }))
+          return { ok: true, jobs: list }
+        }
+        if (op === 'add') {
+          const machine = sanitizeName(args && args.machine)
+          const command = String((args && args.command) || '').trim()
+          const expr = String((args && args.expr) || '').trim()
+          if (!machine) throw new Error('缺少 machine')
+          if (!command) throw new Error('缺少 command')
+          if (expr.split(/\s+/).length !== 5) throw new Error('cron 表达式必须为 5 字段')
+          if (!cronMatch(new Date(), expr)) {
+            // 仅校验格式,不强制当前分钟匹配
+          }
+          const id = genId('cron')
+          state.cron = state.cron || []
+          state.cron.push({ id, sessionId, machine, command, expr, enabled: args.enabled !== false, createdAt: Date.now(), nextRunAt: nextCronRun(expr, new Date())?.getTime() || null })
+          saveState()
+          pushAudit(sessionId, machine, 'vm_cron_add', { id, expr }, true, null)
+          return { ok: true, job: state.cron.find((c) => c.id === id) }
+        }
+        if (op === 'remove') {
+          const name = String((args && args.name) || '').trim()
+          const idx = (state.cron || []).findIndex((c) => c.id === name || c.name === name || (args && args.machine && c.machine === sanitizeName(args.machine)))
+          if (idx < 0) throw new Error('未找到定时任务')
+          const [job] = state.cron.splice(idx, 1)
+          saveState()
+          pushAudit(sessionId, job.machine, 'vm_cron_remove', { id: job.id }, true, null)
+          return { ok: true, removed: job }
+        }
+        if (op === 'toggle' || op === 'run') {
+          const name = String((args && args.name) || '').trim()
+          const job = (state.cron || []).find((c) => c.id === name || c.name === name)
+          if (!job) throw new Error('未找到定时任务')
+          if (op === 'toggle') {
+            job.enabled = !job.enabled
+            saveState()
+            return { ok: true, job: { ...job } }
+          }
+          const out = await submitJob(ctx, sessionId, job.machine, job.command)
+          job.lastRunAt = Date.now()
+          saveState()
+          return { ok: true, job: { ...job }, triggered: out }
+        }
+        throw new Error('不支持的 operation')
+      },
+    })
+
+    registerTool({
+      name: 'vm_template',
+      description: '查看/管理初始化模板库(python/node/docker/cuda 内置模板,支持本地 JSON/YAML 或 GitHub raw URL)。operation=list|get|save|remove;save 保存自定义模板。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['list', 'get', 'save', 'remove'], description: '操作类型,默认 list。' },
+          name: { type: 'string', description: '模板名。' },
+          description: { type: 'string', description: '模板描述。' },
+          distro: { type: 'string', description: '模板发行版(debian/alpine)。' },
+          init_script: { type: 'string', description: '模板初始化脚本。' },
+          cloud_init: { type: 'string', description: '模板 cloud-init 用户数据。' },
+          source: { type: 'string', description: '模板来源(本地 JSON/YAML 路径或 GitHub raw URL),get 时使用。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const op = (args && args.operation) || 'list'
+        if (op === 'list') return { ok: true, templates: templateList() }
+        if (op === 'get') {
+          const name = String((args && args.name) || '').trim()
+          if (!name) throw new Error('缺少模板名')
+          if (state.templates && state.templates[name]) return { ok: true, template: { name, ...state.templates[name], custom: true } }
+          const builtin = builtinTemplates()[name]
+          if (builtin) return { ok: true, template: { name, ...builtin, builtin: true } }
+          const tpl = await resolveTemplate(args.source || name)
+          return { ok: true, template: { name, ...tpl } }
+        }
+        if (op === 'save') {
+          const name = sanitizeName(args && args.name) || ('tpl-' + Date.now().toString(36))
+          state.templates = state.templates || {}
+          state.templates[name] = {
+            name,
+            description: String((args && args.description) || '').slice(0, 200),
+            distro: (args && args.distro) || 'debian',
+            init_script: args && args.init_script,
+            cloud_init: args && args.cloud_init,
+            createdAt: Date.now(),
+          }
+          saveState()
+          pushAudit(sessionId, null, 'vm_template_save', { name }, true, null)
+          return { ok: true, template: state.templates[name] }
+        }
+        if (op === 'remove') {
+          const name = String((args && args.name) || '').trim()
+          if (!state.templates || !state.templates[name]) throw new Error('未找到模板')
+          delete state.templates[name]
+          saveState()
+          return { ok: true, removed: name }
+        }
+        throw new Error('不支持的 operation')
+      },
+    })
+registerTool({
+      name: 'vm_resize',
+      description: '运行时热调整虚拟机资源规格(cpus/memory/disk),基于 OrbStack 官方 orb config set。需要 manage 权限;磁盘等变更会自动重启 VM 生效。',
+      parameters: {
+        type: 'object',
+        properties: {
+          machine: { type: 'string', description: '目标机器名称;省略使用当前会话默认机器。' },
+          cpus: { type: 'number', description: '可选:新的 CPU 核数。' },
+          memory: { type: 'string', description: '可选:新内存,如 4G / 4096MiB。' },
+          disk: { type: 'string', description: '可选:新磁盘上限,如 32G / 64G。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const t0 = Date.now()
+        try {
+          const out = await resizeMachine(ctx, sessionId, sanitizeName(args && args.machine), args && args.cpus, args && args.memory, args && args.disk)
+          pushAudit(sessionId, out.machine, 'vm_resize', out.changes, true, null, Date.now() - t0)
+          return out
+        } catch (err) {
+          pushAudit(sessionId, sanitizeName(args && args.machine), 'vm_resize', {}, false, err && err.message || err, Date.now() - t0)
+          throw err
+        }
+      },
+    })
+
+    registerTool({
+      name: 'vm_metrics',
+      description: '查看虚拟机资源指标历史(CPU/内存/磁盘,每 30 秒采样,默认最近 120 条)。',
+      parameters: {
+        type: 'object',
+        properties: {
+          machine: { type: 'string', description: '目标机器名称;省略使用当前会话默认机器。' },
+          limit: { type: 'integer', description: '可选返回条数,默认 120,最大 1440。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const hint = sanitizeName(args && args.machine)
+        const target = hint ? await resolveExistingMachineByName(ctx, sessionId, hint) : await resolveDefaultMachine(ctx, sessionId)
+        if (!canExec(sessionId, target.name)) throw new Error('没有权限查看指标')
+        return metricsView(target.name, Math.min(1440, Number(args && args.limit) || 120))
+      },
+    })
+
+    registerTool({
+      name: 'vm_export',
+      description: '导出虚拟机为镜像文件(基于 OrbStack 官方 orb export)。需要 manage 权限;输出路径需在工作区内。',
+      parameters: {
+        type: 'object',
+        properties: {
+          machine: { type: 'string', description: '目标机器名称;省略使用当前会话默认机器。' },
+          output_path: { type: 'string', description: '本地导出路径(相对于工作区)。' },
+        },
+        required: ['output_path'],
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const t0 = Date.now()
+        try {
+          const out = await exportMachine(ctx, sessionId, sanitizeName(args && args.machine), args && args.output_path)
+          pushAudit(sessionId, out.machine, 'vm_export', { path: out.path }, true, null, Date.now() - t0)
+          return out
+        } catch (err) {
+          pushAudit(sessionId, sanitizeName(args && args.machine), 'vm_export', {}, false, err && err.message || err, Date.now() - t0)
+          throw err
+        }
+      },
+    })
+
+    registerTool({
+      name: 'vm_import',
+      description: '从镜像文件导入虚拟机(基于 OrbStack 官方 orb import -n)。需要会话内机器未满。',
+      parameters: {
+        type: 'object',
+        properties: {
+          input_path: { type: 'string', description: '本地导入文件路径(相对于工作区)。' },
+          machine: { type: 'string', description: '可选:导入后的机器名称;省略自动生成。' },
+          distro: { type: 'string', enum: ['debian', 'alpine'], description: '可选:发行版标记,默认 debian。' },
+        },
+        required: ['input_path'],
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const t0 = Date.now()
+        try {
+          const out = await importMachine(ctx, sessionId, args && args.input_path, sanitizeName(args && args.machine), (args && args.distro) || 'debian')
+          pushAudit(sessionId, out.machine, 'vm_import', { path: args && args.input_path }, true, null, Date.now() - t0)
+          return out
+        } catch (err) {
+          pushAudit(sessionId, sanitizeName(args && args.machine), 'vm_import', {}, false, err && err.message || err, Date.now() - t0)
+          throw err
+        }
+      },
+    })
+
+    registerTool({
+      name: 'vm_service_discover',
+      description: '服务发现:列出全部/单台运行中的虚拟机及其 IP、运行中端口转发、已注册服务。可用于 VM 间互访。',
+      parameters: {
+        type: 'object',
+        properties: {
+          machine: { type: 'string', description: '可选:只发现指定机器。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        return discoverServices(ctx, sessionId, sanitizeName(args && args.machine))
+      },
+    })
+
+    registerTool({
+      name: 'vm_service_register',
+      description: '注册/注销一个 VM 上对外开放的服务(用于服务发现)。operation=register|unregister;返回服务清单。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['register', 'unregister'], description: '操作类型,默认 register。' },
+          machine: { type: 'string', description: '目标机器名称。' },
+          service: { type: 'string', description: '服务名,如 backend-api。' },
+          port: { type: 'integer', description: '服务端口。' },
+          meta: { type: 'string', description: '可选元信息/备注。' },
+        },
+        required: ['machine', 'service'],
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const machine = sanitizeName(args && args.machine)
+        const service = String((args && args.service) || '').trim()
+        if (!recordOfMachine(machine)) throw new Error('未找到机器: ' + machine)
+        if (!canManage(sessionId, machine)) throw new Error('没有权限注册服务')
+        state.services = state.services || {}
+        if (!state.services[machine]) state.services[machine] = []
+        const list = state.services[machine]
+        const op = (args && args.operation) || 'register'
+        if (op === 'unregister') {
+          state.services[machine] = list.filter((s) => s.service !== service)
+        } else {
+          let found = list.find((s) => s.service === service)
+          if (found) found.port = Number(args.port)
+          else list.push({ service, port: Number(args.port), meta: String((args && args.meta) || ''), registeredAt: Date.now() })
+        }
+        saveState()
+        pushAudit(sessionId, machine, 'vm_service_' + op, { service, port: args.port }, true, null)
+        return { ok: true, machine, services: state.services[machine] }
+      },
+    })
   }
 
-  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.1.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
+  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.2.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
 }
 
 export { apply }
 export const inject = ['webServer', 'tools']
+// ---- 模板库 ----
+function builtinTemplates() {
+  return {
+    python: { description: 'Python 3 基础环境', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq python3 python3-pip' },
+    node: { description: 'Node.js LTS 基础环境', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq curl && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y -qq nodejs npm' },
+    docker: { description: 'Docker 环境（VM 内安装 Docker CLI）', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq ca-certificates curl && install -m 0755 -d /etc/apt/keyrings && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list && apt-get update -qq && apt-get install -y -qq docker-ce docker-ce-cli containerd.io' },
+    cuda: { description: 'CUDA 基础环境（示例模板，建议按需调整）', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq build-essential linux-headers-$(uname -r) && apt-get install -y -qq nvidia-driver' },
+  }
+}
+
+function parseSimpleYaml(text) {
+  const out = {}
+  let currentKey = null
+  const lines = String(text || '').split('\n')
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, '')
+    if (!line.trim() || line.trim().startsWith('#')) continue
+    const indent = line.match(/^\s*/)[0].length
+    const m = line.match(/^(\w[\w-]*):\s*(.*)$/)
+    if (m) {
+      currentKey = m[1]
+      out[currentKey] = m[2].trim()
+    } else if (currentKey && indent > 0) {
+      out[currentKey] = (out[currentKey] || '') + line.trim() + '\n'
+    }
+  }
+  if (out.init_script) out.init_script = out.init_script.trim()
+  if (out.cloud_init) out.cloud_init = out.cloud_init.trim()
+  return out
+}
+
+function templateList() {
+  const builtin = Object.entries(builtinTemplates()).map(([name, t]) => ({ name, description: t.description, builtin: true }))
+  const custom = Object.entries(state.templates || {}).map(([name, t]) => ({ name, description: t.description || '', builtin: false }))
+  return builtin.concat(custom)
+}
+
+async function resolveTemplate(template) {
+  const name = String(template || '').trim()
+  if (!name) return null
+  if (state.templates && state.templates[name]) return state.templates[name]
+  const builtin = builtinTemplates()[name]
+  if (builtin) return builtin
+  // 支持本地 JSON/YAML 文件路径
+  if (name.startsWith('/') || name.startsWith('.')) {
+    const full = existsSync(name) ? name : join(process.cwd(), name)
+    if (!existsSync(full)) throw new Error('模板文件不存在: ' + full)
+    const text = readFileSync(full, 'utf8')
+    if (full.endsWith('.json')) return JSON.parse(text)
+    return parseSimpleYaml(text)
+  }
+  // 支持 GitHub raw URL
+  if (/^https?:\/\//.test(name)) {
+    const res = await fetch(name, { timeout: 20000 })
+    if (!res.ok) throw new Error('模板下载失败: HTTP ' + res.status)
+    const text = await res.text()
+    if (name.endsWith('.json')) return JSON.parse(text)
+    return parseSimpleYaml(text)
+  }
+  throw new Error('未找到模板: ' + name + '（可用 vm_template 查看）')
+}
+// ---- 指标历史 ----
+function pushMetrics(name, point) {
+  if (!state.metrics[name]) state.metrics[name] = []
+  const list = state.metrics[name]
+  list.push(point)
+  if (list.length > MAX_METRICS_POINTS) list.splice(0, list.length - MAX_METRICS_POINTS)
+}
+
+async function sampleAllMetrics() {
+  try {
+    const machines = await listMachines()
+    const running = machines.filter((m) => m.state === 'running' && !state.snapshots[m.name])
+    for (const m of running) {
+      const probe = await probeStatus(m.name).catch(() => null)
+      if (!probe) continue
+      pushMetrics(m.name, { ts: Date.now(), ...probe })
+    }
+    saveState()
+  } catch (e) { /* 采样失败静默 */ }
+}
+
+function metricsView(name, limit) {
+  const list = state.metrics[name] || []
+  const n = Math.max(1, Number(limit) || 120)
+  return { ok: true, machine: name, metrics: list.slice(-n).map((p) => ({ ...p })) }
+}
+
+// ---- 热调整资源 ----
+function sizeToBytes(value) {
+  const m = String(value || '').trim().match(/^(\d+(?:\.\d+)?)\s*([KMGTP]?)(i?B?)$/i)
+  if (!m) return null
+  const n = parseFloat(m[1])
+  const unit = m[2].toUpperCase()
+  const map = { K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4, P: 1024 ** 5 }
+  return Math.round(n * (map[unit] || 1))
+}
+
+function sizeToMiB(value) {
+  const bytes = sizeToBytes(value)
+  return bytes === null ? null : Math.ceil(bytes / 1024 / 1024)
+}
+
+async function resizeMachine(ctx, sessionId, machineName, cpus, memory, disk) {
+  const target = machineName
+    ? await resolveExistingMachineByName(ctx, sessionId, machineName)
+    : await resolveDefaultMachine(ctx, sessionId)
+  if (!canManage(sessionId, target.name)) throw new Error('没有权限调整资源(' + target.name + ')')
+  const changes = []
+  if (cpus !== undefined && String(cpus).trim() !== '') {
+    const val = Number(cpus)
+    if (!(val > 0)) throw new Error('cpus 必须为正数')
+    const res = await orb(['config', 'set', 'machine.' + target.name + '.cpu', String(val)], { timeoutMs: 30000 })
+    if (res.exitCode !== 0) throw new Error('设置 CPU 失败: ' + String(res.stderr || res.stdout || ''))
+    changes.push('cpu=' + val)
+  }
+  if (memory !== undefined && String(memory).trim() !== '') {
+    const mib = sizeToMiB(memory) || Number(memory)
+    if (!(mib > 0)) throw new Error('memory 必须为正数')
+    const res = await orb(['config', 'set', 'machine.' + target.name + '.memory_mib', String(mib)], { timeoutMs: 30000 })
+    if (res.exitCode !== 0) throw new Error('设置内存失败: ' + String(res.stderr || res.stdout || ''))
+    changes.push('memory_mib=' + mib)
+  }
+  if (disk !== undefined && String(disk).trim() !== '') {
+    const bytes = sizeToBytes(disk) || Number(disk)
+    if (!(bytes > 0)) throw new Error('disk 必须为正数')
+    const res = await orb(['config', 'set', 'machine.' + target.name + '.disk_bytes', String(bytes)], { timeoutMs: 30000 })
+    if (res.exitCode !== 0) throw new Error('设置磁盘失败: ' + String(res.stderr || res.stdout || ''))
+    changes.push('disk_bytes=' + bytes)
+  }
+  if (changes.length === 0) throw new Error('至少需要指定 cpus / memory / disk 之一')
+  const m = await machineStateOf(target.name)
+  if (m && m.state === 'running') {
+    await orb(['restart', target.name], { timeoutMs: 300000 })
+    await ensureNetworkApplied(target.name)
+  }
+  return { ok: true, machine: target.name, changes }
+}
+// ---- 导入导出 ----
+async function exportMachine(ctx, sessionId, machineName, outputPath) {
+  const target = machineName
+    ? await resolveExistingMachineByName(ctx, sessionId, machineName)
+    : await resolveDefaultMachine(ctx, sessionId)
+  if (!canManage(sessionId, target.name)) throw new Error('没有权限导出(' + target.name + ')')
+  const local = resolveLocalPath(ctx, outputPath)
+  const res = await orb(['export', target.name, local], { timeoutMs: 900000 })
+  if (res.exitCode !== 0) throw new Error('orb export 失败: ' + String(res.stderr || res.stdout || '').slice(0, 300))
+  return { ok: true, machine: target.name, path: local }
+}
+
+async function importMachine(ctx, sessionId, inputPath, nameHint, distro) {
+  const local = resolveLocalPath(ctx, inputPath)
+  if (!existsSync(local)) throw new Error('导入文件不存在: ' + local)
+  const name = sanitizeName(nameHint) || await uniqueMachineName(await sessionTitleOf(ctx, sessionId), sessionId, null)
+  if (ownerOfMachine(name)) throw new Error('机器名称已存在: ' + name)
+  const res = await orb(['import', '-n', name, local], { timeoutMs: 900000 })
+  if (res.exitCode !== 0) throw new Error('orb import 失败: ' + String(res.stderr || res.stdout || '').slice(0, 300))
+  const list = sessionMachines(sessionId)
+  list.push({ name, distro: distro === 'alpine' ? 'alpine' : 'debian', createdAt: Date.now(), lastUsedAt: Date.now(), imported: true })
+  state.machines[sessionId] = list
+  saveState()
+  return { ok: true, machine: name }
+}
+
+// ---- 服务发现 ----
+async function discoverServices(ctx, sessionId, machineName) {
+  const machines = await listMachines()
+  const targets = machineName ? machines.filter((m) => m.name === machineName) : machines
+  const out = []
+  for (const m of targets) {
+    const rec = recordOfMachine(m.name)
+    const owner = rec ? rec.sessionId : null
+    const item = {
+      name: m.name,
+      state: m.state,
+      distro: m.distro,
+      ip4: null,
+      ip6: null,
+      owner,
+      tunnels: tunnelView().filter((t) => t.machine === m.name && t.status === 'running'),
+      services: (state.services && state.services[m.name]) || [],
+    }
+    if (m.state === 'running') {
+      const info = await orb(['info', '-f', 'json', m.name], { timeoutMs: 30000 })
+      if (info.exitCode === 0) {
+        try {
+          const parsed = JSON.parse(info.stdout)
+          item.ip4 = parsed.ip4 || null
+          item.ip6 = parsed.ip6 || null
+        } catch (e) { /* ignore */ }
+      }
+    }
+    out.push(item)
+  }
+  return { ok: true, machines: out }
+}
