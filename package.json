@@ -1,10 +1,11 @@
 {
   "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
-  "version": "0.0.3",
-  "description": "OrbStack VM sandbox: per-session sandbox VMs (debian/alpine) with a VM tab next to trajectory/terminal, vm_list/vm_create/vm_exec/vm_delete tools, archive/delete cleanup, running cap, idle sleep, compact detail view and live shell logs.",
+  "version": "0.1.0",
+  "description": "OrbStack VM sandbox: full VM plugin with snapshots/restore, upload/download, lifecycle (start/stop/restart/status), port forwarding, background jobs, audit, sharing/permissions/reclamation, network policy, custom resources, cloud-init init scripts, parallel vm_exec and rich status.",
   "type": "module",
   "scripts": {
-    "prepare": "node ./scripts/prepare.mjs"
+    "prepare": "node ./scripts/prepare.mjs",
+    "verify": "node scripts/verify.mjs"
   },
   "main": "dsh-plugin-vm-sandbox/lib/index.js",
   "exports": {

@@ -391,11 +391,15 @@ window.__ModuleLoader__.load({
 							React.createElement("span", { className: "vmsb-meta" }, (m.distro || "?") + (m.version ? " " + m.version : "")),
 							React.createElement("span", { className: "vmsb-state " + (STATE_TEXT_CLASS[m.state] || "").trim() }, STATE_LABEL[m.state] || m.state),
 							React.createElement("span", { className: "vmsb-owner" }, m.owner ? (m.owner.title || m.owner.sessionId) : "未归属"),
+							m.kind === "snapshot" ? React.createElement("span", { className: "vmsb-own-tag" }, "快照") : null,
 							isOwn ? React.createElement("span", { className: "vmsb-own-tag" }, "本会话") : null,
 							React.createElement("span", { className: "vmsb-actions" },
 								m.state !== "running"
 									? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("start", m.name); } }, busyName === "start" ? "启动中…" : "启动")
 									: React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("sleep", m.name); } }, busyName === "sleep" ? "休眠中…" : "休眠"),
+								m.state === "running"
+									? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("restart", m.name); } }, busyName === "restart" ? "重启中…" : "重启")
+									: null,
 								(!m.owner || isOwn)
 									? React.createElement("button", { className: "vmsb-btn vmsb-danger", disabled: !!busyName, onClick: (e) => { stop(e); onDelete(m.name); } },
 										busyName === "delete" ? "删除中…" : (confirmDel === m.name ? "确认删除?" : "删除"))

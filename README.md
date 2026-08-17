@@ -2,19 +2,23 @@
 
 DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 
-在会话视图环中新增「虚拟机」页签，为每个会话提供 OrbStack 沙箱虚拟机（debian/alpine，同一会话必要时可多台），支持一键新建/查看/启停/删除、展开查看详细配置，并提供 `vm_list` / `vm_create` / `vm_exec` / `vm_delete` 模型工具（支持 `machine` 参数，必要情况下可跨会话使用）。状态持久化在 `~/.dsh/vm-sandbox/state.json`。
+在会话视图环中新增「虚拟机」页签，为每个会话提供 OrbStack 沙箱虚拟机（debian/alpine，同一会话必要时可多台），支持一键新建/查看/启停/重启/删除、展开查看详细配置、实时 Shell 日志，并提供完整的模型工具集。状态持久化在 `~/.dsh/vm-sandbox/state.json`。
 
-## 功能
+## 功能（v0.1.0）
 
-- 会话视图环中新增「虚拟机」页签
-- 同一会话可创建多台 OrbStack 沙箱虚拟机（必要时），支持 debian（默认）与 alpine；`vm_exec` 省略 `machine` 时复用本会话默认机器
-- 跨会话使用：通过 `vm_exec` / `vm_create` 的 `machine` 参数可指定并执行其他会话的虚拟机（删除仍仅限归属会话）
-- 实时展示所有沙箱：名称、发行版、状态、归属会话
-- 展开查看机器 ID、CPU/内存/磁盘限额、网络/SSH 配置、IP 等详情
-- 展开后实时查看该虚拟机的 Shell 执行记录：命令、运行状态、耗时与输出结果（折叠式展示）
-- 面板支持一键新建（debian/alpine）、启动、休眠、删除（删除需二次确认）
-- 模型工具：`vm_list` / `vm_create` / `vm_exec` / `vm_delete`（`vm_create` / `vm_exec` / `vm_delete` 均支持 `machine` 参数）
-- 资源治理：全局运行上限 25 台、每会话上限 8 台、闲置 30 分钟自动休眠、归档/删除会话自动清理
+- **快照与回滚**：`vm_snapshot` / `vm_snapshot_list` / `vm_restore` / `vm_snapshot_delete`，基于 OrbStack 官方 `orb clone` 实现，按需复制不双倍占用磁盘
+- **文件传输**：`vm_upload` / `vm_download`，基于 OrbStack 官方 `orb push` / `orb pull`，支持目录递归
+- **生命周期管理**：`vm_start` / `vm_stop` / `vm_restart` / `vm_status`
+- **端口转发**：`vm_port_forward` / `vm_port_forward_list` / `vm_port_forward_stop`，基于官方 `ssh MACHINE@orb -N -L`
+- **后台任务管理**：`vm_job_submit` / `vm_job_list` / `vm_job_status` / `vm_job_stop` / `vm_job_output`，长任务在 VM 内后台运行，不受单次 `vm_exec` 超时影响
+- **操作日志与审计**：`vm_audit`，记录谁在何时对哪台机器做了什么、是否成功、错误信息
+- **共享协作完善**：`vm_share` / `vm_unshare` / `vm_policy`，明确归属、exec/manage 权限、每会话配额、闲置休眠/自动删除回收策略
+- **网络策略**：`vm_network`，控制公网访问、VM 间内网互通，并提供 OrbStack 官方 `isolated` / `isolate_network` 配置
+- **自定义资源规格**：`vm_create` 支持 `cpus` / `memory` / `disk`
+- **模板/初始化脚本**：`vm_create` 支持 `init_script`（Shell 自动包装为 cloud-init runcmd）与 `cloud_init`（完整 cloud-config 用户数据）
+- **多机并行执行**：`vm_exec` 支持 `machines` 数组并发执行同一命令
+- **状态查询增强**：`vm_status` 返回 IP、uptime、CPU/内存/磁盘限额与用量、最近 Shell 记录、归属、权限、快照来源
+- 原有能力保留：`vm_list` / `vm_create` / `vm_exec` / `vm_delete`、会话视图环「虚拟机」页签、实时 Shell 记录、运行上限 25 台、每会话上限 8 台、闲置自动休眠、归档/删除会话自动清理
 
 ## 文件说明
 
@@ -35,62 +39,27 @@ DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
         └── prepare.mjs        # 内层包 prepare：构建 lib/
 ```
 
-> 安装包（`tgz` / `zip`）通过 **GitHub Releases** 发布，不存放在源码仓库中。
-
 ## 安装
 
-### 方式 A：使用 dsh plugin 安装预构建 tarball（推荐，需要已安装 pnpm）
-
-从 Releases 下载 tgz 后，在插件包/tgz 所在目录执行：
+从 Releases 下载 tgz 后在插件包/tgz 所在目录执行：
 
 ```bash
-# 下载地址：https://github.com/GHJIVHIDD/dsh-plugin-vm-sandbox/releases
-dsh plugin --profile web add ./dsh-plugin-vm-sandbox-0.0.3.tgz
+dsh plugin --profile web add ./dsh-plugin-vm-sandbox-0.1.0.tgz
 ```
 
 因为本插件同时带有 `dsh.bundle` 声明，`dsh plugin` 会自动把它加入 profile 的 `bundles` 层，并应用 `cordis.patch.yml` 自动插入虚拟机页签。
 
 ## 使用
 
-安装后重启/刷新：
-
 ```bash
 dsh --profile web
 ```
 
-打开 Web 界面进入任意会话，在会话视图环中点击「虚拟机」即可看到当前环境中的 OrbStack 沙箱虚拟机；会话智能体也可以通过 `vm_exec` / `vm_create` 等工具自动创建和使用沙箱。
-
-## 更新内容
-
-### v0.0.3（最新）
-
-- 同一会话可创建多台虚拟机（必要时）：
-  - `vm_create` 每次调用创建一台新机器，可用 `machine` 参数指定名称（仅小写字母/数字，≤8 位，缺省自动生成）
-  - `vm_exec` 省略 `machine` 时复用本会话默认（最近使用）机器，仅在没有任何机器时自动创建，避免重复建机
-  - `vm_delete` 增加 `machine` 参数，可删除本会话指定机器；省略时删除默认机器
-- 全局运行上限从 5 台提升至 **25 台**；新增每会话上限 8 台（防磁盘耗尽，可在配置常量中调整）
-- 跨会话使用：`vm_exec` / `vm_create` 传入其他会话的机器名称时可直接使用（必要情况下跨会话），返回结果带 `ownerSession` / `crossSession` 标识；删除仍仅限归属会话
-- 「虚拟机」页签新增「＋ Debian / ＋ Alpine」一键新建按钮，头部展示总台数、运行数、上限与「本会话 N 台」
-- 点击新建后立即显示「创建中…」待建行（机器名 + 发行版 + 预计耗时），约 1-3 分钟建好后自动变为正常行；超过 10 分钟未出现则自动消失
-- 修复面板新建静默失败：`execFile` 的 `signal` 选项不再传入 `null`（会抛 `ERR_INVALID_ARG_TYPE` 导致后台建机瞬间失败）
-- 新旧版本混合运行兼容：客户端按宿主返回的 `cap` 字段门控新能力、`own` 兼容旧版单条记录格式，宿主未重启时刷新页面不会报错或出现无效按钮
-- 状态文件 `~/.dsh/vm-sandbox/state.json` 迁移为按会话多台记录（旧单台记录自动兼容迁移）
-- 新增 Host 接口：`GET /vmsb-api/create?session=<id>&distro=<debian|alpine>`（异步创建，立即返回）
-
-### v0.0.2
-
-- 新增虚拟机 Shell 实时执行记录：
-  - 记录 `vm_exec` 执行的命令、开始/结束时间、耗时、退出码、stdout/stderr 和运行状态
-  - 在「虚拟机」页签中展开任意虚拟机，可实时查看该机器的 Shell 记录
-  - 每条命令以折叠卡片展示，点击可展开查看完整输出
-- 新增 Host 接口：`GET /vmsb-api/shell?name=<machine>`
-- 前端每 2 秒自动刷新当前展开虚拟机的 Shell 记录
-- 删除虚拟机或对账清理时同步清理对应的 Shell 日志
-- UI 风格参考「轨迹 / 对话 / 终端」的折叠式命令记录样式
+打开 Web 界面进入任意会话，点击「虚拟机」即可看到当前环境中的 OrbStack 沙箱虚拟机；会话智能体可通过 `vm_create` / `vm_exec` / `vm_snapshot` / `vm_upload` / `vm_job_submit` / `vm_network` 等工具自动管理沙箱。
 
 ## 兼容性
 
 - 面向 DeepSeek Harness `web` profile
-- 需要 Web 端已启用 `@deepseek-ai/dsh-client-runtime` 与 `@deepseek-ai/dsh-client-ui-conversation`（标准 web profile 自带）
+- 需要 Web 端已启用 `@deepseek-ai/dsh-client-runtime` 与 `@deepseek-ai/dsh-client-ui-conversation`
 - 宿主机需要安装并运行 OrbStack，`orb` 命令位于 `/usr/local/bin/orb`
-- 插件版本：0.0.3
+- 插件版本：0.1.0
