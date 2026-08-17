@@ -20,8 +20,8 @@ DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 - 文件传输：`vm_upload` / `vm_download`
 - 生命周期：`vm_start` / `vm_stop` / `vm_restart` / `vm_status`
 - 端口转发：`vm_port_forward` / `vm_port_forward_list` / `vm_port_forward_stop`
-- 后台任务：`vm_job_submit` / `vm_job_list` / `vm_job_status` / `vm_job_stop` / `vm_job_output`
-- 审计：`vm_audit`
+- 后台任务：`vm_job_submit` / `vm_job_list` / `vm_job_status` / `vm_job_stop` / `vm_job_output` / `vm_job_log`(轮转/归档)
+- 审计：`vm_audit`（UI 支持 CSV/JSON 导出）
 - 共享协作：`vm_share` / `vm_unshare` / `vm_policy`
 - 网络策略：`vm_network`（含 allowlist）
 - 自定义资源：`vm_create(cpus/memory/disk)`

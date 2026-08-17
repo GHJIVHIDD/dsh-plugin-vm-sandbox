@@ -83,6 +83,17 @@ window.__ModuleLoader__.load({
 					return j;
 				});
 		}
+		function download(name, text) {
+			const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement("a");
+			a.href = url;
+			a.download = name;
+			document.body.appendChild(a);
+			a.click();
+			a.remove();
+			URL.revokeObjectURL(url);
+		}
 
 		const STATE_LABEL = {
 			running: "运行中",
@@ -474,13 +485,21 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 				if (tab === "audit") {
 					if (!audits) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
 					if (audits.length === 0) return React.createElement("div", { className: "vmsb-muted" }, "暂无审计记录。");
-					return React.createElement("div", { className: "vmsb-list" }, audits.map((a) => React.createElement("div", { key: a.id, className: "vmsb-item" },
-						React.createElement("div", { className: "vmsb-row" },
-							React.createElement("span", { className: "vmsb-name" }, a.operation || ""),
-							React.createElement("span", { className: "vmsb-meta" }, (a.machine || "—") + " · " + (a.ok ? "成功" : "失败")),
-							React.createElement("span", { className: "vmsb-owner" }, formatTime(a.ts) + " · " + (a.sessionId || "")),
+					const toCSV = () => download("vmsb-audit.csv", "ts,operation,machine,sessionId,ok,error\n" + audits.map((a) => [a.ts, a.operation, a.machine, a.sessionId, a.ok ? 1 : 0, (a.error || "").replace(/,/g, " ")].join(",")).join("\n"));
+					const toJSON = () => download("vmsb-audit.json", JSON.stringify(audits, null, 2));
+					return React.createElement("div", null,
+						React.createElement("div", { style: { marginBottom: 8 } },
+							panelButton(toCSV, "导出 CSV"),
+							panelButton(toJSON, "导出 JSON"),
 						),
-					)));
+						React.createElement("div", { className: "vmsb-list" }, audits.map((a) => React.createElement("div", { key: a.id, className: "vmsb-item" },
+							React.createElement("div", { className: "vmsb-row" },
+								React.createElement("span", { className: "vmsb-name" }, a.operation || ""),
+								React.createElement("span", { className: "vmsb-meta" }, (a.machine || "—") + " · " + (a.ok ? "成功" : "失败")),
+								React.createElement("span", { className: "vmsb-owner" }, formatTime(a.ts) + " · " + (a.sessionId || "")),
+							),
+						))),
+					);
 				}
 				if (tab === "meta") {
 					if (!meta) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");

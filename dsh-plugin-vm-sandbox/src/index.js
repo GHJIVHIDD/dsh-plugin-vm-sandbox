@@ -1042,6 +1042,22 @@ async function jobFullOutput(jobId, maxBytes) {
   const res = await orb(['run', '-m', job.machine, '-u', 'root', 'sh', '-lc', 'tail -c ' + limit + ' ' + job.dir + '/out.log 2>/dev/null || true'], { timeoutMs: 30000 })
   return { ok: true, id: job.id, machine: job.machine, command: job.command, log: String(res.stdout || '') }
 }
+async function jobLogRotate(jobId) {
+  const job = jobById(jobId)
+  if (!job) throw new Error('未找到后台任务: ' + jobId)
+  const ts = Date.now()
+  const archived = job.dir + '/out.log.' + ts + '.archived'
+  const res = await orb(['run', '-m', job.machine, '-u', 'root', 'sh', '-lc', 'if [ -f ' + job.dir + '/out.log ]; then mv ' + job.dir + '/out.log ' + archived + '; : > ' + job.dir + '/out.log; echo ' + archived + '; else echo none; fi'], { timeoutMs: 30000 })
+  return { ok: true, id: job.id, machine: job.machine, archived: String(res.stdout || '').trim(), exitCode: res.exitCode }
+}
+
+async function jobLogArchives(jobId) {
+  const job = jobById(jobId)
+  if (!job) throw new Error('未找到后台任务: ' + jobId)
+  const res = await orb(['run', '-m', job.machine, '-u', 'root', 'sh', '-lc', 'ls -1 ' + job.dir + '/*.archived 2>/dev/null || true'], { timeoutMs: 30000 })
+  const files = String(res.stdout || '').trim().split('\n').filter(Boolean)
+  return { ok: true, id: job.id, machine: job.machine, archives: files }
+}
 // ---------- P1/P2/P3: 定时任务、模板、指标、调整、导入导出、服务发现 ----------
 
 // ---- Cron 定时任务 ----
@@ -2501,6 +2517,32 @@ registerTool({
       output: OUT,
       async execute(args, exec) {
         return jobFullOutput(String(args && args.job_id || ''), args && args.max_bytes)
+      },
+    })
+registerTool({
+      name: 'vm_job_log',
+      description: '管理后台任务日志:operation=get 读取日志(可选 max_bytes)、rotate 轮转归档、archives 列出归档。用于日志轮转/归档/下载场景。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['get', 'rotate', 'archives'], description: '操作类型,默认 get。' },
+          job_id: { type: 'string', description: '任务 ID。' },
+          max_bytes: { type: 'integer', description: 'get 时可选最大字节数,默认 1048576。' },
+        },
+        required: ['job_id'],
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const op = (args && args.operation) || 'get'
+        const jobId = String(args && args.job_id || '')
+        const job = jobById(jobId)
+        if (!job) throw new Error('未找到后台任务: ' + jobId)
+        if (job.sessionId !== sessionId && !canManage(sessionId, job.machine)) throw new Error('没有权限管理该任务日志')
+        if (op === 'rotate') return jobLogRotate(jobId)
+        if (op === 'archives') return jobLogArchives(jobId)
+        return jobFullOutput(jobId, args && args.max_bytes)
       },
     })
 
