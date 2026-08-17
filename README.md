@@ -63,3 +63,13 @@ dsh --profile web
 - 需要 Web 端已启用 `@deepseek-ai/dsh-client-runtime` 与 `@deepseek-ai/dsh-client-ui-conversation`
 - 宿主机需要安装并运行 OrbStack，`orb` 命令位于 `/usr/local/bin/orb`
 - 插件版本：0.1.0
+
+## 验证
+
+```bash
+# 静态/结构验证：27 个工具 + schema + 语法
+npm run verify
+
+# 集成冒烟测试：会创建并删除临时 OrbStack 虚拟机
+VMSB_SMOKE_SESSION=<当前会话ID> npm run smoke
+```

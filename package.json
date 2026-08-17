@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "prepare": "node ./scripts/prepare.mjs",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "smoke": "node scripts/smoke.mjs"
   },
   "main": "dsh-plugin-vm-sandbox/lib/index.js",
   "exports": {
