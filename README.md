@@ -56,9 +56,17 @@ DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 ## 验证
 
 ```bash
+# 静态/结构验证
 npm run verify
 
+# 快速冒烟
 VMSB_SMOKE_SESSION=<当前会话ID> npm run smoke
+
+# 全量 E2E：所有工具模块 + 真实 OrbStack 虚拟机
+VMSB_SMOKE_SESSION=<当前会话ID> npm run e2e
+
+# UI 路由层：所有 /vmsb-api 端点
+VMSB_SMOKE_SESSION=<当前会话ID> npm run ui-test
 ```
 
 ## 兼容性

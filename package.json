@@ -6,7 +6,9 @@
   "scripts": {
     "prepare": "node ./scripts/prepare.mjs",
     "verify": "node scripts/verify.mjs",
-    "smoke": "node scripts/smoke.mjs"
+    "smoke": "node scripts/smoke.mjs",
+    "e2e": "node scripts/e2e.mjs",
+    "ui-test": "node scripts/ui-test.mjs"
   },
   "main": "dsh-plugin-vm-sandbox/lib/index.js",
   "exports": {

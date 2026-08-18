@@ -2781,7 +2781,7 @@ registerTool({
           }
           const id = genId('cron')
           state.cron = state.cron || []
-          state.cron.push({ id, sessionId, machine, command, expr, enabled: args.enabled !== false, createdAt: Date.now(), nextRunAt: nextCronRun(expr, new Date())?.getTime() || null })
+          state.cron.push({ id, name: String((args && args.name) || '').trim() || id, sessionId, machine, command, expr, enabled: args.enabled !== false, createdAt: Date.now(), nextRunAt: nextCronRun(expr, new Date())?.getTime() || null })
           saveState()
           pushAudit(sessionId, machine, 'vm_cron_add', { id, expr }, true, null)
           return { ok: true, job: state.cron.find((c) => c.id === id) }
