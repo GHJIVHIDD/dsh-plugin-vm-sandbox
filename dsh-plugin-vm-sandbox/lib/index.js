@@ -24,9 +24,9 @@
 
 import { execFile, spawn } from 'node:child_process'
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
-import { join, resolve, sep } from 'node:path'
+import { basename, join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
@@ -3460,12 +3460,15 @@ registerTool({
 
     registerTool({
       name: 'vm_export',
-      description: '导出虚拟机为镜像文件(基于 OrbStack 官方 orb export)。需要 manage 权限;输出路径需在工作区内。',
+      description: '导出虚拟机为镜像文件(D3,based on orb export)。output_path 为本地导出路径(工作区内)。slice_mb>0 时按指定大小分片到 <output_path>.parts/;remote_machine+remote_dir 时把单文件或(配 slice)分片推送到另一台 VM 内。需要 manage 权限。',
       parameters: {
         type: 'object',
         properties: {
-          machine: { type: 'string', description: '目标机器名称;省略使用当前会话默认机器。' },
-          output_path: { type: 'string', description: '本地导出路径(相对于工作区)。' },
+          machine: { type: 'string', description: '源机器名称;省略使用当前会话默认机器。' },
+          output_path: { type: 'string', description: '本地导出路径(相对于工作区);分片时为 <path>.parts/ 目录。' },
+          slice_mb: { type: 'number', description: '可选:分片大小(MB),>0 时按片导出。' },
+          remote_machine: { type: 'string', description: '可选:推送到另一台 VM(远端备份);目录见 remote_dir。' },
+          remote_dir: { type: 'string', description: '可选:远端目录,默认 /root。' },
         },
         required: ['output_path'],
       },
@@ -3475,8 +3478,8 @@ registerTool({
         if (!sessionId) throw new Error('无法确定当前会话')
         const t0 = Date.now()
         try {
-          const out = await exportMachine(ctx, sessionId, sanitizeName(args && args.machine), args && args.output_path)
-          pushAudit(sessionId, out.machine, 'vm_export', { path: out.path }, true, null, Date.now() - t0)
+          const out = await exportMachine(ctx, sessionId, sanitizeName(args && args.machine), args && args.output_path, { sliceMb: args && args.slice_mb, remoteMachine: sanitizeName(args && args.remote_machine), remoteDir: args && args.remote_dir })
+          pushAudit(sessionId, out.machine, 'vm_export', { dest: out.dest && out.dest.type }, true, null, Date.now() - t0)
           return out
         } catch (err) {
           pushAudit(sessionId, sanitizeName(args && args.machine), 'vm_export', {}, false, err && err.message || err, Date.now() - t0)
@@ -3960,6 +3963,8 @@ export const __vmsb = {
   parseProbeOutput, metricValueOf, evalAlert, sampleAllMetrics, evaluateAlerts, metricsView, PROBE_CMD,
   // D4 配额/排队测试接缝
   state, quotaState, sessionResourceUsage, sessionPolicy, processQueuedCreations,
+  // D3 分片导出测试接缝
+  sliceFileByChunks,
 }
 // ---- 模板库 ----
 function builtinTemplates() {
@@ -4179,15 +4184,80 @@ async function resizeMachine(ctx, sessionId, machineName, cpus, memory, disk) {
   return { ok: true, machine: target.name, changes }
 }
 // ---- 导入导出 ----
-async function exportMachine(ctx, sessionId, machineName, outputPath) {
+// D3: 分片导出(按字节切片为大镜像为小段,便于增量传输/远端上行)
+function sliceFileByChunks(localPath, sliceMb, outDir) {
+  const BUF = Math.max(1, Number(sliceMb) || 1024) * 1024 * 1024
+  mkdirSync(outDir, { recursive: true })
+  const fd = openSync(localPath, 'r')
+  let size = 0
+  try { size = statSync(localPath).size } catch (e) { size = 0 }
+  const names = []
+  try {
+    let off = 0
+    let idx = 0
+    while (off < size) {
+      const len = Math.min(BUF, size - off)
+      const chunk = Buffer.alloc(len)
+      readSync(fd, chunk, 0, len, off)
+      const p = join(outDir, 'part-' + String(idx++).padStart(4, '0') + '.img')
+      writeFileSync(p, chunk)
+      names.push(p)
+      off += len
+    }
+  } finally {
+    closeSync(fd)
+  }
+  return { parts: names, size, sliceMb: BUF / 1024 / 1024 }
+}
+
+async function exportMachine(ctx, sessionId, machineName, outputPath, opts) {
+  opts = opts || {}
   const target = machineName
     ? await resolveExistingMachineByName(ctx, sessionId, machineName)
     : await resolveDefaultMachine(ctx, sessionId)
   if (!canManage(sessionId, target.name)) throw new Error('没有权限导出(' + target.name + ')')
   const local = resolveLocalPath(ctx, outputPath)
-  const res = await orb(['export', target.name, local], { timeoutMs: 900000 })
-  if (res.exitCode !== 0) throw new Error('orb export 失败: ' + String(res.stderr || res.stdout || '').slice(0, 300))
-  return { ok: true, machine: target.name, path: local }
+  const base = basename(local)
+  // 先导出到临时文件(切片/远端时需要),否则直接写目标
+  const tmp = join(STATE_DIR, 'export-' + target.name + '-' + Date.now() + '.img')
+  const res = await orb(['export', target.name, tmp], { timeoutMs: 900000 })
+  if (res.exitCode !== 0) {
+    try { rmSync(tmp, { force: true }) } catch (e) { /* ignore */ }
+    throw new Error('orb export 失败: ' + String(res.stderr || res.stdout || '').slice(0, 300))
+  }
+  const dest = {}
+  try {
+    const sliceMb = Number(opts.sliceMb) > 0 ? Number(opts.sliceMb) : 0
+    if (opts.remoteMachine) {
+      const owner = ownerOfMachine(opts.remoteMachine)
+      if (owner && !canExec(sessionId, opts.remoteMachine)) throw new Error('没有权限写入目标机器(' + opts.remoteMachine + ')')
+      const rm = owner ? await resolveExistingMachineByName(ctx, sessionId, opts.remoteMachine) : await resolveMachineByName(ctx, sessionId, opts.remoteMachine)
+      await ensureRunning(rm.name)
+      const rdir = String(opts.remoteDir || '/root').replace(/\/+$/, '')
+      if (sliceMb > 0) {
+        const s = sliceFileByChunks(tmp, sliceMb, local + '.parts')
+        for (const p of s.parts) {
+          const rr = await orb(['push', '-m', rm.name, p, rdir + '/' + basename(p)], { timeoutMs: 600000 })
+          if (rr.exitCode !== 0) throw new Error('推送分片失败: ' + String(rr.stderr || rr.stdout || '').slice(0, 300))
+        }
+        dest.type = 'machine_parts'; dest.machine = rm.name; dest.dir = rdir; dest.parts = s.parts.length
+      } else {
+        const rr = await orb(['push', '-m', rm.name, tmp, rdir + '/' + base], { timeoutMs: 600000 })
+        if (rr.exitCode !== 0) throw new Error('推送镜像失败: ' + String(rr.stderr || rr.stdout || '').slice(0, 300))
+        dest.type = 'machine'; dest.machine = rm.name; dest.path = rdir + '/' + base
+      }
+    } else if (sliceMb > 0) {
+      const outDir = local + '.parts'
+      const s = sliceFileByChunks(tmp, sliceMb, outDir)
+      dest.type = 'parts'; dest.dir = outDir; dest.parts = s.parts.length; dest.sliceMb = s.sliceMb; dest.size = s.size
+    } else {
+      copyFileSync(tmp, local)
+      dest.type = 'local'; dest.path = local
+    }
+  } finally {
+    try { rmSync(tmp, { force: true }) } catch (e) { /* ignore */ }
+  }
+  return { ok: true, machine: target.name, operation: 'export', dest, merge: dest.type === 'parts' ? 'cat ' + dest.dir + '/part-*.img > out.img(供 vm_import)' : null }
 }
 
 async function importMachine(ctx, sessionId, inputPath, nameHint, distro) {
