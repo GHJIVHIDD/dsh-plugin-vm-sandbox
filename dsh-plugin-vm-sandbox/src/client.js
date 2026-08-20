@@ -218,6 +218,80 @@ window.__ModuleLoader__.load({
 			return React.createElement("div", { className: "vmsb-shell-row", "data-status": entry.status, "data-open": open ? "1" : "0" }, ...children);
 		}
 
+		// ── A1 交互终端(xterm via CDN) ─────────────────────────────────────────
+		let xtermPromise = null;
+		function loadXterm() {
+			if (window.Terminal) return Promise.resolve(window.Terminal);
+			if (xtermPromise) return xtermPromise;
+			xtermPromise = new Promise((resolve, reject) => {
+				const link = document.createElement("link");
+				link.rel = "stylesheet";
+				link.href = "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css";
+				document.head.appendChild(link);
+				const script = document.createElement("script");
+				script.src = "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js";
+				script.onload = () => resolve(window.Terminal);
+				script.onerror = () => reject(new Error("xterm 加载失败(需网络访问 cdn.jsdelivr.net)"));
+				document.head.appendChild(script);
+			});
+			return xtermPromise;
+		}
+		function b64ToBytes(b64) {
+			const bin = atob(b64 || "");
+			const u8 = new Uint8Array(bin.length);
+			for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+			return u8;
+		}
+		function strToB64(s) {
+			try { return btoa(unescape(encodeURIComponent(s))); } catch (e) { return btoa(s); }
+		}
+		function TermView(props) {
+			const { machine, sessionId } = props;
+			const hostRef = React.useRef(null);
+			const [state, setState] = React.useState("off");
+			const [err, setErr] = React.useState(null);
+			const termRef = React.useRef(null);
+			const esRef = React.useRef(null);
+			const start = React.useCallback(() => {
+				setState("connecting"); setErr(null);
+				apiPost("term", { session: sessionId, machine }).then(() => loadXterm(), (e) => { throw new Error(String((e && e.message) || e)); })
+					.then((Terminal) => {
+						if (!hostRef.current) return;
+						const t = new Terminal({ cursorBlink: true, fontSize: 12, scrollback: 2000 });
+						t.open(hostRef.current);
+						termRef.current = t;
+						t.writeln("(已连接,回车取提示符…)\r\n");
+						const es = new EventSource("/vmsb-api/term/stream?session=" + encodeURIComponent(sessionId) + "&machine=" + encodeURIComponent(machine));
+						esRef.current = es;
+						es.addEventListener("out", (ev) => { try { t.write(b64ToBytes(ev.data)); } catch (e2) { /* ignore */ } });
+						es.addEventListener("closed", () => { try { t.writeln("\r\n[终端已关闭]"); } catch (e2) { /* ignore */ } });
+						es.onopen = () => { try { t.write("\r"); } catch (e2) { /* ignore */ } };
+						es.onerror = () => { setErr("连接中断"); setState("error"); };
+						t.onData((d) => apiPost("term/input", { session: sessionId, machine, data: strToB64(d) }));
+						t.onResize((d) => apiPost("term/input", { session: sessionId, machine, cols: d.cols, rows: d.rows }));
+						setState("on");
+					}, (e) => { setErr(String((e && e.message) || e)); setState("error"); });
+			}, [machine, sessionId]);
+			const stop = React.useCallback(() => {
+				if (esRef.current) { try { esRef.current.close(); } catch (e) { /* ignore */ } esRef.current = null; }
+				if (termRef.current) { try { termRef.current.dispose(); } catch (e) { /* ignore */ } termRef.current = null; }
+				apiPost("term/close", { session: sessionId, machine });
+				setState("off"); setErr(null);
+			}, [machine, sessionId]);
+			React.useEffect(() => () => { if (esRef.current) esRef.current.close(); }, []);
+			return React.createElement("div", null,
+				state === "on" || state === "connecting"
+					? React.createElement("div", { ref: hostRef, style: { height: 260, marginTop: 6, padding: 4, background: "#0b0d11", borderRadius: 6, overflow: "hidden" } })
+					: React.createElement("div", { className: "vmsb-shell-empty" }, "终端未打开" + (err ? " — " + err : "")),
+				err ? React.createElement("div", { className: "vmsb-error", style: { marginTop: 4 } }, err) : null,
+				React.createElement("div", { style: { marginTop: 4 } },
+					state === "on" || state === "connecting"
+						? React.createElement("button", { className: "vmsb-btn", onClick: stop }, "关闭终端")
+						: React.createElement("button", { className: "vmsb-btn", onClick: start, disabled: state === "connecting" }, "打开终端"),
+				),
+			);
+		}
+
 		// ── view ───────────────────────────────────────────────────────────────
 		function VMView(props) {
 			const sessionId = props.sessionId;
@@ -243,6 +317,7 @@ window.__ModuleLoader__.load({
 			const lastFireRef = React.useRef(0);
 			// 正在创建的机器(宿主立即返回名字,实际建机约 1-3 分钟):[{ machine, distro, since }]
 			const [pending, setPending] = React.useState([]);
+			const [termOpen, setTermOpen] = React.useState({});
 const [tab, setTab] = React.useState("vms");
 			const [snaps, setSnaps] = React.useState(null);
 			const [jobRows, setJobRows] = React.useState(null);
@@ -518,6 +593,14 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 					));
 				}
 				children.push(renderShell(m));
+				// A1: 交互终端(打开/关闭)
+				children.push(React.createElement("div", { key: "term", className: "vmsb-shell" },
+					React.createElement("div", { className: "vmsb-shell-head" },
+						React.createElement("span", { className: "vmsb-shell-title" }, "交互终端"),
+						React.createElement("button", { className: "vmsb-btn", onClick: () => setTermOpen((v) => (Object.assign({}, v, { [m.name]: !(v && v[m.name]) }))) }, (termOpen && termOpen[m.name]) ? "收起终端" : "打开终端"),
+					),
+					(termOpen && termOpen[m.name]) ? React.createElement(TermView, { machine: m.name, sessionId }) : null,
+				));
 				return React.createElement("div", { className: "vmsb-detail" }, ...children);
 			};
 

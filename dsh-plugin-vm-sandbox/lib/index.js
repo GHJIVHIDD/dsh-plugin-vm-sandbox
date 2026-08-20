@@ -1796,6 +1796,76 @@ async function probeStatus(name) {
   return out
 }
 
+// ---------- A1: 交互式终端(ssh PTY + SSE 流; 输入走 POST+token) ----------
+const termSessions = new Map() // session:machine -> { proc, subscribers:Set, cols, rows, lastActive }
+function termKey(sessionId, machine) { return sessionId + ':' + machine }
+async function openTermSession(ctx, sessionId, machineName) {
+  const target = machineName
+    ? await resolveExistingMachineByName(ctx, sessionId, machineName)
+    : await resolveDefaultMachine(ctx, sessionId)
+  if (!canExec(sessionId, target.name)) throw new Error('没有权限打开终端(' + target.name + ')')
+  await ensureRunning(target.name)
+  const key = termKey(sessionId, target.name)
+  const existing = termSessions.get(key)
+  if (existing && existing.proc && existing.proc.exitCode === null) {
+    existing.lastActive = Date.now()
+    return existing
+  }
+  if (existing) termSessions.delete(key)
+  // OrbStack 官方交互通道:orb run 无命令 = 交互 shell(indexer stdin 直通)
+  const args = ['run', '-m', target.name, '-u', 'root', '-s']
+  const proc = spawn(ORB, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+  const sub = new Set()
+  const sess = { key, machine: target.name, proc, subscribers: sub, cols: 80, rows: 24, lastActive: Date.now() }
+  const push = (buf) => {
+    sess.lastActive = Date.now()
+    const b64 = buf.toString('base64')
+    for (const s of sub) { try { s.write('event: out\ndata: ' + b64 + '\n\n') } catch (e) { /* ignore */ } }
+  }
+  proc.stdout.on('data', push)
+  proc.stderr.on('data', push)
+  proc.on('close', (code) => {
+    for (const s of sub) { try { s.write('event: closed\ndata: ' + (code == null ? '' : code) + '\n\n') } catch (e) { /* ignore */ } }
+    sub.clear()
+  })
+  termSessions.set(key, sess)
+  return sess
+}
+function writeTerm(sessionId, machine, dataB64) {
+  const sess = termSessions.get(termKey(sessionId, machine))
+  if (!sess || !sess.proc || sess.proc.exitCode !== null) return false
+  sess.lastActive = Date.now()
+  try { sess.proc.stdin.write(Buffer.from(String(dataB64 || ''), 'base64')) } catch (e) { return false }
+  return true
+}
+function resizeTerm(sessionId, machine, cols, rows) {
+  const sess = termSessions.get(termKey(sessionId, machine))
+  if (!sess || !sess.proc || sess.proc.exitCode !== null) return false
+  sess.cols = cols
+  sess.rows = rows
+  return true
+}
+function closeTerm(sessionId, machine) {
+  const key = termKey(sessionId, machine)
+  const sess = termSessions.get(key)
+  if (!sess || !sess.proc) return false
+  try { sess.proc.kill('SIGHUP') } catch (e) { /* ignore */ }
+  try { sess.proc.stdin.end() } catch (e) { /* ignore */ }
+  setTimeout(() => { if (sess.proc.exitCode === null) { try { sess.proc.kill('SIGKILL') } catch (e) { /* ignore */ } } }, 2000)
+  termSessions.delete(key)
+  return true
+}
+// 空闲回收:无订阅且 5 分钟未活动才关闭
+function sweepTermSessions() {
+  const now = Date.now()
+  for (const [k, s] of termSessions) {
+    if (s.subscribers.size === 0 && now - s.lastActive > 5 * 60 * 1000) {
+      const sepIdx = k.indexOf(':')
+      closeTerm(s.key.slice(0, sepIdx), s.key.slice(sepIdx + 1))
+    }
+  }
+}
+
 async function machineDetail(ctx, name, sessionId) {
   const res = await orb(['info', '-f', 'json', name], { timeoutMs: 30000 })
   if (res.exitCode !== 0) {
@@ -2050,7 +2120,7 @@ function apply(ctx) {
     }, 'vmsb: metrics')
 // 状态兜底落盘:周期 flush + 处理创建队列 + 卸载时落盘(配合去抖,保证不丢最后 300ms)
     ctx.effect(() => {
-      const timer = setInterval(() => { flushStateNow(); processQueuedCreations(ctx).catch(() => {}) }, 60 * 1000)
+      const timer = setInterval(() => { flushStateNow(); processQueuedCreations(ctx).catch(() => {}); sweepTermSessions() }, 60 * 1000)
       if (timer && typeof timer.unref === 'function') timer.unref()
       return () => { clearInterval(timer); try { flushStateNow() } catch (e) { /* ignore */ } }
     }, 'vmsb: state flush')
@@ -2392,6 +2462,72 @@ route('/vmsb-api/snapshots', async (req, res) => {
           const sessionId = q.get('session') || ''
           if (!sessionId) throw new Error('缺少会话标识')
           sendJson(res, 200, aggregateReport(sessionId, sanitizeName(q.get('machine') || '')))
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      // A1: 交互式终端(open/input/close POST+token; stream GET SSE 同源)
+      route('/vmsb-api/term', async (req, res) => {
+        try {
+          const body = await gate(req, res, { method: 'POST', token: true })
+          if (body === null) return
+          const q = pFrom(req, body)
+          const sessionId = q.get('session') || ''
+          if (!sessionId) throw new Error('缺少会话标识')
+          const sess = await openTermSession(ctx, sessionId, sanitizeName(q.get('machine') || ''))
+          sendJson(res, 200, { ok: true, session: sessionId, machine: sess.machine, cols: sess.cols, rows: sess.rows })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/term/input', async (req, res) => {
+        try {
+          const body = await gate(req, res, { method: 'POST', token: true })
+          if (body === null) return
+          const q = pFrom(req, body)
+          const sessionId = q.get('session') || ''
+          if (!sessionId) throw new Error('缺少会话标识')
+          const machine = sanitizeName(q.get('machine') || '')
+          const cols = Number(q.get('cols')); const rows = Number(q.get('rows'))
+          if (cols > 0 && cols <= 400 && rows > 0 && rows <= 200) resizeTerm(sessionId, machine, cols, rows)
+          const written = writeTerm(sessionId, machine, q.get('data'))
+          sendJson(res, 200, { ok: written, written })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/term/close', async (req, res) => {
+        try {
+          const body = await gate(req, res, { method: 'POST', token: true })
+          if (body === null) return
+          const q = pFrom(req, body)
+          const sessionId = q.get('session') || ''
+          const machine = sanitizeName(q.get('machine') || '')
+          if (sessionId) closeTerm(sessionId, machine)
+          sendJson(res, 200, { ok: true })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/term/stream', async (req, res) => {
+        try {
+          const b = await gate(req, res, { method: 'GET' })
+          if (b === null) return
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          if (!sessionId) throw new Error('缺少会话标识')
+          const machine = sanitizeName(q.get('machine') || '')
+          const sess = await openTermSession(ctx, sessionId, machine)
+          res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-store')
+          res.setHeader('Connection', 'keep-alive')
+          res.setHeader('X-Accel-Buffering', 'no')
+          res.flushHeaders && res.flushHeaders()
+          res.write('event: open\ndata: ' + sess.machine + '\n\n')
+          sess.subscribers.add(res)
+          const cleanup = () => { sess.subscribers.delete(res); try { res.end() } catch (e) { /* ignore */ } }
+          req.on('close', cleanup)
+          req.on('error', cleanup)
         } catch (err) {
           sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
         }
