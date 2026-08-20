@@ -4,7 +4,7 @@ DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 
 在会话视图环中新增「虚拟机」页签，为每个会话提供 OrbStack 沙箱虚拟机（debian/alpine，同一会话必要时可多台）。状态持久化在 `~/.dsh/vm-sandbox/state.json`。
 
-## 功能（v0.2.0）
+## 功能（v0.2.1）
 
 ### Web UI
 

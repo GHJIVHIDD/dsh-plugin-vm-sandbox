@@ -1,7 +1,7 @@
 /**
  * Host loader entry for the deployment-level VM sandbox plugin.
  *
- * v0.2.0 upgrade — adds Web UI tabs, cron, auto snapshots, templates, resize, export/import, metrics, groups/fail-fast, network allowlist and service discovery:
+ * v0.2.1 upgrade — adds Web UI tabs, cron, auto snapshots, templates, resize, export/import, metrics, groups/fail-fast, network allowlist and service discovery:
  *   1. 快照与回滚 vm_snapshot / vm_restore / vm_snapshot_delete / vm_snapshot_list
  *   2. 文件传输 vm_upload / vm_download (OrbStack official orb push/pull)
  *   3. 生命周期管理 vm_start / vm_stop / vm_restart / vm_status
@@ -3029,7 +3029,7 @@ registerTool({
     })
   }
 
-  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.2.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
+  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.2.1, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
 }
 
 export { apply }
