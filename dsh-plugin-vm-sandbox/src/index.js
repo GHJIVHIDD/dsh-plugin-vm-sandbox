@@ -2234,8 +2234,16 @@ function apply(ctx) {
         const found = recordOfMachine(name)
         if (found && found.type === 'snapshot') throw new Error('快照请使用 vm_snapshot_delete 删除')
         if (!canOwner(sessionId, name)) throw new Error('该机器属于其他会话或未获得删除权限，不能删除')
+        // A4: 删除前自动打撤销快照(默认开,undo=false 关闭;快照配额满则忽略)
+        let undoSnapshot = null
+        if (q.get('undo') !== '0' && q.get('undo') !== 'false') {
+          try {
+            const out = await createSnapshot(ctx, sessionId, name, 'undo-before-delete')
+            undoSnapshot = out.snapshot ? out.snapshot.name : null
+          } catch (e) { /* 快照失败不阻断删除 */ }
+        }
         await removeMachineByName(name)
-        sendJson(res, 200, { ok: true, name })
+        sendJson(res, 200, { ok: true, name, undoSnapshot })
       } catch (err) {
         sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
       }

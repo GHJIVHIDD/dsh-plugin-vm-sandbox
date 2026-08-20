@@ -231,6 +231,16 @@ window.__ModuleLoader__.load({
 			const [shells, setShells] = React.useState({});
 			const [shellErr, setShellErr] = React.useState({});
 			const [creating, setCreating] = React.useState(null);
+			// A4: 完成通知 toast + 删除撤销
+			const [toast, setToast] = React.useState(null);
+			const [undo, setUndo] = React.useState(null);
+			const toastTimerRef = React.useRef(null);
+			const showToast = React.useCallback((msg) => {
+				setToast(msg);
+				if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+				toastTimerRef.current = window.setTimeout(() => setToast(null), 6000);
+			}, []);
+			const lastFireRef = React.useRef(0);
 			// 正在创建的机器(宿主立即返回名字,实际建机约 1-3 分钟):[{ machine, distro, since }]
 			const [pending, setPending] = React.useState([]);
 const [tab, setTab] = React.useState("vms");
@@ -325,6 +335,41 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 				return () => { stopped = true; if (timerId !== null) window.clearInterval(timerId); };
 			}, [expanded, sessionId]);
 
+			// A4: VM 创建完成通知(本会话出现新机器)
+			const prevMachinesRef = React.useRef(null);
+			React.useEffect(() => {
+				if (!data) return;
+				const prev = prevMachinesRef.current;
+				const nowSet = new Set((data.machines || []).map((m) => m.name));
+				if (prev) {
+					const created = (data.own || []).map((o) => o.name).filter((n) => n && !prev.has(n));
+					if (created.length) showToast("VM 创建完成: " + created.join(", "));
+				}
+				prevMachinesRef.current = nowSet;
+			}, [data, showToast]);
+
+			// A4: 指标告警(阈值触发)通知
+			React.useEffect(() => {
+				let stopped = false;
+				const poll = () => {
+					api("alerts", { session: sessionId }).then(
+						(r) => {
+							if (stopped) return;
+							const fires = r.recentFires || [];
+							if (fires.length > 0 && fires[0].ts > lastFireRef.current) {
+								lastFireRef.current = fires[0].ts;
+								const f = fires[0];
+								showToast("告警: " + (f.machine || "") + " " + (f.name || f.metric) + " = " + f.value);
+							}
+						},
+						() => { /* 忽略 */ },
+					);
+				};
+				poll();
+				const timer = window.setInterval(poll, 15000);
+				return () => { stopped = true; window.clearInterval(timer); };
+			}, [sessionId, showToast]);
+
 			const act = React.useCallback((action, name) => {
 				setBusy((b) => Object.assign({}, b, { [name]: action }));
 				apiPost(action, { name, session: sessionId }).then(
@@ -364,14 +409,35 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 			}, [sessionId, refreshList]);
 			const onCreate = ((distro) => onCreateOpts(distro, {}));
 
+			// A4: 删除带撤销快照(面板默认 undo=1)
+			const doDelete = React.useCallback((name) => {
+				apiPost("delete", { name, session: sessionId, undo: "1" }).then(
+					(res) => {
+						setConfirmDel(null);
+						if (res && res.undoSnapshot) setUndo({ machine: name, snapshot: res.undoSnapshot, at: Date.now() });
+						else showToast("已删除: " + name);
+						refreshList();
+					},
+					(err) => { setConfirmDel(null); setError(String((err && err.message) || err)); },
+				);
+			}, [sessionId, refreshList, showToast]);
+
+			const undoDelete = React.useCallback(() => {
+				if (!undo) return;
+				apiPost("snapshot", { action: "restore", snapshot: undo.snapshot, session: sessionId }).then(
+					() => { setUndo(null); showToast("已撤销删除,恢复 " + undo.machine); refreshList(); },
+					(err) => { setUndo(null); setError("撤销失败: " + String((err && err.message) || err)); },
+				);
+			}, [undo, sessionId, refreshList, showToast]);
+
 			const onDelete = React.useCallback((name) => {
 				if (confirmDel === name) {
-					act("delete", name);
+					doDelete(name);
 				} else {
 					setConfirmDel(name);
 					window.setTimeout(() => setConfirmDel((c) => (c === name ? null : c)), 3000);
 				}
-			}, [confirmDel, act]);
+			}, [confirmDel, doDelete]);
 
 			const toggle = React.useCallback((name) => {
 				if (expanded === name) {
@@ -697,6 +763,11 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 				),
 				quickRow,
 				error ? React.createElement("div", { className: "vmsb-error" }, error) : null,
+				undo ? React.createElement("div", { className: "vmsb-error", style: { display: "flex", alignItems: "center", gap: 8 } },
+					React.createElement("span", null, "已删除「" + undo.machine + "」(已留撤销快照)"),
+					React.createElement("button", { className: "vmsb-btn", onClick: undoDelete }, "撤销删除"),
+				) : null,
+				toast ? React.createElement("div", { style: { margin: "4px 0 8px", padding: "6px 10px", borderRadius: 6, border: "1px solid var(--dsw-alias-border-l1,rgba(128,128,128,.3))", background: "var(--dsw-alias-bg-layer-2,rgba(110,140,255,.12))", color: "var(--dsw-alias-label-primary,inherit)", fontSize: 12 } }, toast) : null,
 				tab === "vms" ? (machines === null ? React.createElement("div", { className: "vmsb-muted" }, "加载中…") : rows) : renderTab(),
 			);
 		}
