@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
-  "version": "0.2.1",
-  "description": "OrbStack VM sandbox v0.2.0: web UI tabs (snapshots/jobs/audit/network), cron tasks, auto snapshot policies, template library, hot resize, export/import, metrics history, multi-machine groups/fail-fast, network allowlist and service discovery.",
+  "version": "0.3.0",
+  "description": "OrbStack VM sandbox v0.3.0: retained v0.2 capability + panel API hardening (POST/same-origin/CSRF token), allowlist shell-injection guard, atomic state writes with .bak fallback, debounced + partitioned persistence (audit.json/metrics.json), workspace-restricted template reads, unit-test skeleton.",
   "type": "module",
   "scripts": {
     "prepare": "node ./scripts/prepare.mjs"
