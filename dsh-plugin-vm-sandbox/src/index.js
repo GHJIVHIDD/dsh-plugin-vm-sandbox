@@ -760,7 +760,7 @@ async function removeMachineByName(name) {
 
 async function removeSessionMachines(sessionId) {
   const list = sessionMachines(sessionId)
-  if (list.length === 0) return false
+  if (list.length === 0 && !Object.values(state.snapshots).some((s) => s && s.sessionId === sessionId)) return false
   for (const rec of list) {
     try {
       await deleteMachineByName(rec.name)
@@ -769,7 +769,16 @@ async function removeSessionMachines(sessionId) {
     }
   }
   delete state.machines[sessionId]
+  // 一并清理该会话创建的快照(否则会话消失后快照成为无人可删的残留)
+  for (const n of Object.keys(state.snapshots)) {
+    const snap = state.snapshots[n]
+    if (snap && snap.sessionId === sessionId) {
+      try { await orb(['delete', '-f', n], { timeoutMs: 180000 }) } catch (err) { /* ignore */ }
+      delete state.snapshots[n]
+    }
+  }
   saveState()
+  flushStateNow()
   return true
 }
 // ---------- B1: 安全基线 / 加固(vm_harden) ----------
@@ -1145,7 +1154,9 @@ async function restoreSnapshot(ctx, sessionId, snapshotName) {
 async function deleteSnapshot(ctx, sessionId, snapshotName) {
   const snap = snapshotRecord(snapshotName)
   if (!snap) throw new Error('未找到快照: ' + snapshotName)
-  if (!canOwner(sessionId, snapshotName)) throw new Error('只有快照归属会话可以删除')
+  // 允许删除无主快照(归属会话已不存在,否则将成为无人可删的残留)
+  const snapOwner = state.snapshots[snapshotName] ? state.snapshots[snapshotName].sessionId : null
+  if (snapOwner && snapOwner !== sessionId) throw new Error('只有快照归属会话可以删除')
   const res = await orb(['delete', '-f', snapshotName], { timeoutMs: 180000 })
   if (res.exitCode !== 0) {
     throw new Error('删除快照机器失败: ' + String(res.stderr || res.stdout || '').slice(0, 300))
