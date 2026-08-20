@@ -245,63 +245,82 @@ window.__ModuleLoader__.load({
 		function strToB64(s) {
 			try { return btoa(unescape(encodeURIComponent(s))); } catch (e) { return btoa(s); }
 		}
+		function stripAnsi(t) {
+			return String(t || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "").replace(/\r/g, "\n");
+		}
 		function TermView(props) {
 			const { machine, sessionId } = props;
 			const hostRef = React.useRef(null);
-			const [state, setState] = React.useState("off");
+			const [state, setState] = React.useState("off"); // off|connecting|on|error|plain
 			const [err, setErr] = React.useState(null);
+			const [plainText, setPlainText] = React.useState("");
+			const plainBuf = React.useRef("");
 			const termRef = React.useRef(null);
 			const esRef = React.useRef(null);
 			const startedRef = React.useRef(false);
+			const plainRef = React.useRef(null);
+			const send = React.useCallback((s) => { try { apiPost("term/input", { session: sessionId, machine, data: strToB64(s) }); } catch (e) { /* ignore */ } }, [machine, sessionId]);
 			const start = React.useCallback(() => {
 				if (startedRef.current) return;
 				startedRef.current = true;
-				setState("connecting"); setErr(null);
-				apiPost("term", { session: sessionId, machine })
-					.then(() => loadXterm())
-					.then((Terminal) => {
-						const open = () => {
-							const el = hostRef.current;
-							if (!el || termRef.current) return !!termRef.current;
-							const t = new Terminal({ cursorBlink: true, fontSize: 12, scrollback: 2000 });
-							t.open(el);
-							termRef.current = t;
-							t.writeln("(已连接,回车取提示符…)\r\n");
-							const es = new EventSource("/vmsb-api/term/stream?session=" + encodeURIComponent(sessionId) + "&machine=" + encodeURIComponent(machine));
-							esRef.current = es;
-							es.addEventListener("out", (ev) => { try { t.write(b64ToBytes(ev.data)); } catch (e2) { /* ignore */ } });
-							es.addEventListener("closed", () => { try { t.writeln("\r\n[终端已关闭]\r\n"); } catch (e2) { /* ignore */ } });
-							es.onopen = () => { try { t.write("\r"); t.focus(); } catch (e2) { /* ignore */ } };
-							es.onerror = () => { if (esRef.current === es && startedRef.current) setErr("连接中断,浏览器将自动重试"); };
-							t.onData((d) => apiPost("term/input", { session: sessionId, machine, data: strToB64(d) }));
-							t.onResize((d) => apiPost("term/input", { session: sessionId, machine, cols: d.cols, rows: d.rows }));
-							setState("on");
-							try { t.focus(); } catch (e2) { /* ignore */ }
-							return true;
-						};
-						if (!open()) {
-							// 容器节点尚未就绪:下一帧重试(消除挂载竞态)
-							window.setTimeout(() => { if (!open() && startedRef.current) setErr("终端容器未就绪,请重试"); }, 120);
-						}
-					}, (e) => { setErr(String((e && e.message) || e)); setState("error"); startedRef.current = false; });
-			}, [machine, sessionId]);
+				setState("connecting"); setErr(null); plainBuf.current = ""; setPlainText("");
+				const openPlain = () => {
+					if (termRef.current) return;
+					termRef.current = { mode: "plain" };
+					const es = new EventSource("/vmsb-api/term/stream?session=" + encodeURIComponent(sessionId) + "&machine=" + encodeURIComponent(machine));
+					esRef.current = es;
+					es.addEventListener("out", (ev) => { try { const txt = stripAnsi(atob(ev.data)); plainBuf.current += txt; if (plainBuf.current.length > 200000) plainBuf.current = plainBuf.current.slice(-200000); setPlainText(plainBuf.current); } catch (e2) { /* ignore */ } });
+					es.addEventListener("closed", () => { plainBuf.current += "\r\n[终端已关闭]\r\n"; setPlainText(plainBuf.current); });
+					es.onerror = () => { if (esRef.current === es && startedRef.current) setErr("连接中断,浏览器将自动重试"); };
+					setState("plain");
+					window.setTimeout(() => { const el = plainRef.current; if (el) try { el.focus(); } catch (e2) { /* ignore */ } }, 50);
+				};
+				apiPost("term", { session: sessionId, machine }).then(() => {
+					let settled = false;
+					const timer = window.setTimeout(() => { if (!settled) { settled = true; openPlain(); } }, 8000);
+					loadXterm().then((Terminal) => {
+						if (settled) return;
+						settled = true; window.clearTimeout(timer);
+						const el = hostRef.current;
+						if (!el) { openPlain(); return; }
+						const t = new Terminal({ cursorBlink: true, fontSize: 12, scrollback: 2000 });
+						t.open(el); termRef.current = t;
+						t.writeln("(已连接,输入命令后回车执行…)\r\n");
+						const es = new EventSource("/vmsb-api/term/stream?session=" + encodeURIComponent(sessionId) + "&machine=" + encodeURIComponent(machine));
+						esRef.current = es;
+						es.addEventListener("out", (ev) => { try { t.write(b64ToBytes(ev.data)); } catch (e2) { /* ignore */ } });
+						es.addEventListener("closed", () => { try { t.writeln("\r\n[终端已关闭]\r\n"); } catch (e2) { /* ignore */ } });
+						es.onerror = () => { if (esRef.current === es && startedRef.current) setErr("连接中断,浏览器将自动重试"); };
+						t.onData((d) => { try { t.write(d); } catch (e2) { /* ignore */ } send(d); }); // 本地回显,管道模式远端不回显
+						t.onResize((d) => apiPost("term/input", { session: sessionId, machine, cols: d.cols, rows: d.rows }));
+						setState("on");
+						try { t.focus(); } catch (e2) { /* ignore */ }
+					}, () => { if (!settled) { settled = true; window.clearTimeout(timer); openPlain(); } });
+				}, (e) => { setErr(String((e && e.message) || e)); setState("error"); startedRef.current = false; });
+			}, [machine, sessionId, send]);
 			const stop = React.useCallback(() => {
 				startedRef.current = false;
 				if (esRef.current) { try { esRef.current.close(); } catch (e) { /* ignore */ } esRef.current = null; }
-				if (termRef.current) { try { termRef.current.dispose(); } catch (e) { /* ignore */ } termRef.current = null; }
+				if (termRef.current && termRef.current.dispose) { try { termRef.current.dispose(); } catch (e) { /* ignore */ } }
+				termRef.current = null;
 				apiPost("term/close", { session: sessionId, machine });
 				setState("off"); setErr(null);
 			}, [machine, sessionId]);
 			React.useEffect(() => () => { if (esRef.current) esRef.current.close(); }, []);
-			const active = state === "on" || state === "connecting";
+			const active = state === "on" || state === "connecting" || state === "plain";
 			return React.createElement("div", null,
-				React.createElement("div", {
-					ref: hostRef,
-					onClick: () => { if (termRef.current) { try { termRef.current.focus(); } catch (e2) { /* ignore */ } } },
-					style: active
-						? { height: 260, marginTop: 6, padding: 4, background: "#0b0d11", borderRadius: 6, overflow: "hidden" }
-						: { display: "none" },
-				}),
+				state === "plain"
+					? React.createElement("textarea", { ref: plainRef, readOnly: false, spellCheck: false,
+							onKeyDown: (e) => {
+								if (e.metaKey || e.ctrlKey) return;
+								if (e.key === "Enter") { e.preventDefault(); plainBuf.current += "\n"; setPlainText(plainBuf.current); send("\n"); return; }
+								if (e.key === "Backspace") { e.preventDefault(); plainBuf.current = plainBuf.current.slice(0, -1); setPlainText(plainBuf.current); send("\x7f"); return; }
+								if (e.key && e.key.length === 1) { e.preventDefault(); plainBuf.current += e.key; setPlainText(plainBuf.current); send(e.key); }
+							},
+							style: { width: "100%", height: 200, marginTop: 6, fontFamily: "ui-monospace,Menlo,monospace", fontSize: 12, background: "#0b0d11", color: "#e6e6e6", border: "1px solid rgba(128,128,128,.3)", borderRadius: 6, padding: 8, whiteSpace: "pre", overflow: "auto" },
+							value: plainText })
+					: React.createElement("div", { ref: hostRef, onClick: () => { if (termRef.current && termRef.current.focus) { try { termRef.current.focus(); } catch (e2) { /* ignore */ } } },
+							style: active ? { height: 260, marginTop: 6, padding: 4, background: "#0b0d11", borderRadius: 6, overflow: "hidden" } : { display: "none" } }),
 				err ? React.createElement("div", { className: "vmsb-error", style: { marginTop: 4 } }, err) : null,
 				React.createElement("div", { style: { marginTop: 4 } },
 					active

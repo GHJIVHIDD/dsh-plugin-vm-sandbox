@@ -1813,7 +1813,10 @@ async function probeStatus(name) {
   return out
 }
 
-// ---------- A1: 交互式终端(ssh PTY + SSE 流; 输入走 POST+token) ----------
+// ---------- A1: 交互式终端(orb run 交互 shell + SSE 流; 输入走 POST+token) ----------
+// 说明:OrbStack 的 `orb run` 在 stdin 为管道时以非交互方式驱动远端 shell——
+// 远端不打印提示符、不回显输入,但命令会执行、stdout 会流回。
+// 因此「本地回显」由客户端负责(输入即时可见),服务端保证命令执行与输出回流。
 const termSessions = new Map() // session:machine -> { proc, subscribers:Set, cols, rows, lastActive }
 function termKey(sessionId, machine) { return sessionId + ':' + machine }
 async function openTermSession(ctx, sessionId, machineName) {
@@ -1829,7 +1832,6 @@ async function openTermSession(ctx, sessionId, machineName) {
     return existing
   }
   if (existing) termSessions.delete(key)
-  // OrbStack 官方交互通道:orb run 无命令 = 交互 shell(indexer stdin 直通)
   const args = ['run', '-m', target.name, '-u', 'root', '-s']
   const proc = spawn(ORB, args, { stdio: ['pipe', 'pipe', 'pipe'] })
   const sub = new Set()
@@ -1852,7 +1854,12 @@ function writeTerm(sessionId, machine, dataB64) {
   const sess = termSessions.get(termKey(sessionId, machine))
   if (!sess || !sess.proc || sess.proc.exitCode !== null) return false
   sess.lastActive = Date.now()
-  try { sess.proc.stdin.write(Buffer.from(String(dataB64 || ''), 'base64')) } catch (e) { return false }
+  try {
+    // 管道模式下无终端 CR→LF 转换:xterm 的回车是 \r,需转成 \n 否则命令会拼成 'cmd\r' 执行失败
+    let buf = Buffer.from(String(dataB64 || ''), 'base64')
+    for (let i = 0; i < buf.length; i++) if (buf[i] === 0x0d) buf[i] = 0x0a
+    sess.proc.stdin.write(buf)
+  } catch (e) { return false }
   return true
 }
 function resizeTerm(sessionId, machine, cols, rows) {
