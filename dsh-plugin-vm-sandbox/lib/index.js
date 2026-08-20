@@ -4181,7 +4181,7 @@ registerTool({
     })
   }
 
-  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.4.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
+  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.4.1, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
 }
 
 export { apply }
