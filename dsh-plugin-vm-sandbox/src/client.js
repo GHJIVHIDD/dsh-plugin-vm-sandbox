@@ -340,9 +340,13 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 				);
 			}, [sessionId, refreshList]);
 
-			const onCreate = React.useCallback((distro) => {
-				setCreating(distro);
-				apiPost("create", { session: sessionId, distro }).then(
+			// A3: 支持模板/附加参数的创建(onCreateOpts);默认按钮复用
+			const onCreateOpts = React.useCallback((distroHint, opts) => {
+				const o = opts || {};
+				const distro = o.distro || distroHint || "debian";
+				const label = o.label || distro;
+				setCreating(label);
+				apiPost("create", Object.assign({ session: sessionId, distro }, o.payload || {})).then(
 					(res) => {
 						setCreating(null);
 						if (res && res.machine) {
@@ -358,6 +362,7 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 					(err) => { setCreating(null); setError(String((err && err.message) || err)); },
 				);
 			}, [sessionId, refreshList]);
+			const onCreate = ((distro) => onCreateOpts(distro, {}));
 
 			const onDelete = React.useCallback((name) => {
 				if (confirmDel === name) {
@@ -460,49 +465,61 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 			const machineNames = new Set(machines ? machines.map((m) => m.name) : []);
 			const pendingRows = (pending || []).filter((p) => !machineNames.has(p.machine) && Date.now() - p.since < 10 * 60 * 1000);
 
+			// A6: 按归属分组(本会话 / 共享给我 / 其他会话)
+			const isOwnByM = (m) => m.ownedByThis || ownNames.has(m.name);
+			const isSharedToMe = (m) => Array.isArray(m.sharedWith) && m.sharedWith.some((s) => s.sessionId === sessionId);
+			const groupOfM = (m) => (isOwnByM(m) ? "本会话" : isSharedToMe(m) ? "共享给我" : "其他会话");
+			const machineItem = (m) => {
+				const isOwn = isOwnByM(m);
+				const busyName = busy[m.name];
+				const isOpen = expanded === m.name;
+				return React.createElement("div", { key: m.name, className: "vmsb-item" },
+					React.createElement("div", { className: "vmsb-row" + (isOwn ? " vmsb-row-own" : "") + (isOpen ? " vmsb-row-open" : ""), onClick: () => toggle(m.name) },
+						React.createElement("span", { className: "vmsb-chev" }, "▸"),
+						React.createElement("span", { className: "vmsb-dot " + (DOT_CLASS[m.state] || "vmsb-dot-stop") }),
+						React.createElement("span", { className: "vmsb-name" }, m.name),
+						React.createElement("span", { className: "vmsb-meta" }, (m.distro || "?") + (m.version ? " " + m.version : "")),
+						React.createElement("span", { className: "vmsb-state " + (STATE_TEXT_CLASS[m.state] || "").trim() }, STATE_LABEL[m.state] || m.state),
+						React.createElement("span", { className: "vmsb-owner" }, m.owner ? (m.owner.title || m.owner.sessionId) : "未归属"),
+						m.kind === "snapshot" ? React.createElement("span", { className: "vmsb-own-tag" }, "快照") : null,
+						isOwn ? React.createElement("span", { className: "vmsb-own-tag" }, "本会话") : (isSharedToMe(m) ? React.createElement("span", { className: "vmsb-own-tag" }, "共享给我") : null),
+						React.createElement("span", { className: "vmsb-actions" },
+							m.state !== "running"
+								? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("start", m.name); } }, busyName === "start" ? "启动中…" : "启动")
+								: React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("sleep", m.name); } }, busyName === "sleep" ? "休眠中…" : "休眠"),
+							m.state === "running"
+								? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("restart", m.name); } }, busyName === "restart" ? "重启中…" : "重启")
+								: null,
+							(!m.owner || isOwn)
+								? React.createElement("button", { className: "vmsb-btn vmsb-danger", disabled: !!busyName, onClick: (e) => { stop(e); onDelete(m.name); } },
+									busyName === "delete" ? "删除中…" : (confirmDel === m.name ? "确认删除?" : "删除"))
+								: null,
+						),
+					),
+					renderDetail(m),
+				);
+			};
+			const pendingItems = pendingRows.map((p) => React.createElement("div", { key: "pending-" + p.machine, className: "vmsb-item" },
+				React.createElement("div", { className: "vmsb-row" },
+					React.createElement("span", { className: "vmsb-chev" }, "▸"),
+					React.createElement("span", { className: "vmsb-dot vmsb-dot-sleep" }),
+					React.createElement("span", { className: "vmsb-name" }, p.machine),
+					React.createElement("span", { className: "vmsb-meta" }, p.distro),
+					React.createElement("span", { className: "vmsb-state vmsb-state-sleep" }, "创建中…"),
+					React.createElement("span", { className: "vmsb-owner" }, "约 1-3 分钟"),
+				),
+			));
+			const grouped = (machines || []).reduce((acc, m) => { const t = groupOfM(m); (acc[t] = acc[t] || []).push(m); return acc; }, {});
+			const groupOrder = ["本会话", "共享给我", "其他会话"];
 			const rows = machines === null ? null : machines.length === 0 && pendingRows.length === 0
-				? React.createElement("div", { className: "vmsb-muted" }, "当前没有 OrbStack 虚拟机。可新建(debian/alpine),或由会话智能体通过 vm_exec / vm_create 创建沙箱。")
+				? React.createElement("div", { className: "vmsb-muted" }, "当前没有 OrbStack 虚拟机。可新建(debian/alpine),点上方「快速开始」选场景一键创建,或由会话智能体通过 vm_exec / vm_create 创建沙箱。")
 				: React.createElement("div", { className: "vmsb-list" },
-					machines.map((m) => {
-					const isOwn = m.ownedByThis || ownNames.has(m.name);
-					const busyName = busy[m.name];
-					const isOpen = expanded === m.name;
-					return React.createElement("div", { key: m.name, className: "vmsb-item" },
-						React.createElement("div", { className: "vmsb-row" + (isOwn ? " vmsb-row-own" : "") + (isOpen ? " vmsb-row-open" : ""), onClick: () => toggle(m.name) },
-							React.createElement("span", { className: "vmsb-chev" }, "▸"),
-							React.createElement("span", { className: "vmsb-dot " + (DOT_CLASS[m.state] || "vmsb-dot-stop") }),
-							React.createElement("span", { className: "vmsb-name" }, m.name),
-							React.createElement("span", { className: "vmsb-meta" }, (m.distro || "?") + (m.version ? " " + m.version : "")),
-							React.createElement("span", { className: "vmsb-state " + (STATE_TEXT_CLASS[m.state] || "").trim() }, STATE_LABEL[m.state] || m.state),
-							React.createElement("span", { className: "vmsb-owner" }, m.owner ? (m.owner.title || m.owner.sessionId) : "未归属"),
-							m.kind === "snapshot" ? React.createElement("span", { className: "vmsb-own-tag" }, "快照") : null,
-							isOwn ? React.createElement("span", { className: "vmsb-own-tag" }, "本会话") : null,
-							React.createElement("span", { className: "vmsb-actions" },
-								m.state !== "running"
-									? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("start", m.name); } }, busyName === "start" ? "启动中…" : "启动")
-									: React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("sleep", m.name); } }, busyName === "sleep" ? "休眠中…" : "休眠"),
-								m.state === "running"
-									? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("restart", m.name); } }, busyName === "restart" ? "重启中…" : "重启")
-									: null,
-								(!m.owner || isOwn)
-									? React.createElement("button", { className: "vmsb-btn vmsb-danger", disabled: !!busyName, onClick: (e) => { stop(e); onDelete(m.name); } },
-										busyName === "delete" ? "删除中…" : (confirmDel === m.name ? "确认删除?" : "删除"))
-									: null,
-							),
-						),
-						renderDetail(m),
-					);
-				}),
-					pendingRows.map((p) => React.createElement("div", { key: "pending-" + p.machine, className: "vmsb-item" },
-						React.createElement("div", { className: "vmsb-row" },
-							React.createElement("span", { className: "vmsb-chev" }, "▸"),
-							React.createElement("span", { className: "vmsb-dot vmsb-dot-sleep" }),
-							React.createElement("span", { className: "vmsb-name" }, p.machine),
-							React.createElement("span", { className: "vmsb-meta" }, p.distro),
-							React.createElement("span", { className: "vmsb-state vmsb-state-sleep" }, "创建中…"),
-							React.createElement("span", { className: "vmsb-owner" }, "约 1-3 分钟"),
-						),
-					)),
+					groupOrder.flatMap((t) => {
+						const g = grouped[t] || [];
+						if (g.length === 0) return [];
+						return [React.createElement("div", { key: "gl-" + t, className: "vmsb-muted", style: { margin: "6px 0 2px", textAlign: "left" } }, t + " · " + g.length), ...g.map(machineItem)];
+					}),
+					...pendingItems,
 				);
 const panelButton = (onClick, label, danger) => React.createElement("button", { className: "vmsb-btn" + (danger ? " vmsb-danger" : ""), onClick, style: { marginLeft: 6 } }, label);
 			const renderTab = () => {
@@ -628,10 +645,43 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 				return rows;
 			};
 
+			// A5: 配额一眼可见 + A3 快速开始场景
+			const quota = data && data.quota;
+			const qcell = (k, used, total) => {
+				const pct = total > 0 ? Math.min(100, Math.round((used / total) * 100)) : 0;
+				return React.createElement("span", { key: k, style: { display: "inline-flex", alignItems: "center", gap: 6 } },
+					k,
+					React.createElement("span", { style: { width: 46, height: 6, background: "rgba(128,128,128,.25)", borderRadius: 3, display: "inline-block", overflow: "hidden" } },
+						React.createElement("span", { style: { display: "block", height: "100%", width: pct + "%", background: "var(--dsw-alias-brand-primary,#6e8cff)" } })),
+					used + "/" + total);
+			};
+			const quotaBar = quota ? React.createElement("div", { style: { display: "flex", gap: 14, margin: "2px 0 8px", fontSize: 11.5, color: "var(--dsw-alias-label-secondary,#8d8d8d)", flexWrap: "wrap" } },
+				qcell("机器", quota.machines || 0, quota.maxMachines || 0),
+				quota.cpuQuota
+					? qcell("CPU", quota.cpus || 0, quota.cpuQuota)
+					: React.createElement("span", { key: "cpu", style: {} }, "CPU " + (quota.cpus || 0) + " 核"),
+				quota.memoryQuotaMiB
+					? qcell("内存", Math.round((quota.memoryMiB || 0) / 1024), Math.round(quota.memoryQuotaMiB / 1024))
+					: React.createElement("span", { key: "mem", style: {} }, "内存 " + ((quota.memoryMiB || 0) / 1024).toFixed(1) + " GB"),
+				data && data.queueCount ? React.createElement("span", { key: "q", style: { color: "var(--dsw-alias-state-warn-primary,#f5a524)" } }, "排队 " + data.queueCount + " 个创建请求") : null,
+			) : null;
+			const scenarios = [
+				{ label: "基础 Debian", distro: "debian" },
+				{ label: "基础 Alpine", distro: "alpine" },
+				{ label: "Python 分析", distro: "debian", template: "data" },
+				{ label: "Node 服务", distro: "debian", template: "node" },
+				{ label: "Web 脚手架", distro: "debian", template: "webapp" },
+				{ label: "Docker in VM", distro: "debian", template: "docker" },
+			];
+			const quickRow = canCreate ? React.createElement("div", { style: { display: "flex", gap: 6, alignItems: "center", marginBottom: 10, flexWrap: "wrap" } },
+				React.createElement("span", { className: "vmsb-muted", style: { padding: 0 } }, "快速开始:"),
+				scenarios.map((s) => React.createElement("button", { key: s.label, className: "vmsb-btn", disabled: !!creating, onClick: () => onCreateOpts(s.distro, { label: s.label, payload: s.template ? { template: s.template } : {} }) }, creating === s.label ? "创建中…" : s.label)),
+			) : null;
+
 			return React.createElement("div", { className: "vmsb-panel" },
 				React.createElement("div", { className: "vmsb-head" },
 					React.createElement("span", { className: "vmsb-title" }, "虚拟机沙箱 (OrbStack)"),
-					React.createElement("span", { className: "vmsb-count" }, machines === null ? "" : "共 " + machines.length + " 台 · 运行 " + runningCount + (data && data.cap ? " · 上限 " + data.cap : "") + (ownList.length ? " · 本会话 " + ownList.length + " 台" : "")),
+					React.createElement("span", { className: "vmsb-count" }, machines === null ? "" : "共 " + machines.length + " 台 · 运行 " + runningCount + (data && data.cap ? " · 上限 " + data.cap : "") + (ownList.length ? " · 本会话 " + ownList.length + " 台" : "") + (data && data.queueCount ? " · 排队 " + data.queueCount : "")),
 					canCreate
 						? React.createElement("button", { className: "vmsb-btn", disabled: !!creating, onClick: () => onCreate("debian") }, creating === "debian" ? "创建中…" : "＋ Debian")
 						: null,
@@ -640,10 +690,12 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 						: null,
 					React.createElement("button", { className: "vmsb-btn", onClick: refreshList }, "刷新"),
 				),
+				quotaBar,
 				React.createElement("div", { className: "vmsb-tabs", style: { display: "flex", gap: 6, marginBottom: 10 } },
 					[["vms", "虚拟机"], ["snap", "快照"], ["jobs", "任务"], ["audit", "审计"], ["meta", "网络/共享"]].map(([k, label]) =>
 						React.createElement("button", { key: k, className: "vmsb-btn", style: tab === k ? { background: "var(--dsw-alias-bg-layer-1, rgba(110,140,255,.18))" } : undefined, onClick: () => loadTab(k) }, label)),
 				),
+				quickRow,
 				error ? React.createElement("div", { className: "vmsb-error" }, error) : null,
 				tab === "vms" ? (machines === null ? React.createElement("div", { className: "vmsb-muted" }, "加载中…") : rows) : renderTab(),
 			);

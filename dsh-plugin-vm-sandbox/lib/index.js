@@ -2142,11 +2142,25 @@ function apply(ctx) {
         const cpus = q.get('cpus') || '2'
         const memory = q.get('memory') || '2G'
         const disk = q.get('disk') || '16G'
-        const options = { cpus, memory, disk, isolated: q.get('isolated') === '1' || q.get('isolated') === 'true', isolateNetwork: q.get('isolate_network') === '1' || q.get('isolate_network') === 'true' }
+        const harden = q.get('harden') !== '0' && q.get('harden') !== 'false'
+        const options = { cpus, memory, disk, harden, isolated: q.get('isolated') === '1' || q.get('isolated') === 'true', isolateNetwork: q.get('isolate_network') === '1' || q.get('isolate_network') === 'true' }
+        const template = q.get('template') || ''
+        if (template) {
+          try {
+            const tpl = await resolveTemplate(ctx, template)
+            if (tpl && tpl.init_script && !options.initScript) options.initScript = tpl.init_script
+            if (tpl && tpl.cloud_init && !options.cloudInit) options.cloudInit = tpl.cloud_init
+            if (tpl && tpl.cpus) options.cpus = String(tpl.cpus) || options.cpus
+            if (tpl && tpl.memory) options.memory = String(tpl.memory) || options.memory
+          } catch (e) {
+            sendJson(res, 400, { ok: false, error: '模板解析失败: ' + String((e && e.message) || e).slice(0, 200) })
+            return
+          }
+        }
         createMachineWithName(ctx, sessionId, name, distro, null, options).catch((err) => {
           try { console.error('[vmsb] 面板创建机器失败', name, err) } catch (e) { /* ignore */ }
         })
-        sendJson(res, 200, { ok: true, status: 'creating', machine: name, distro })
+        sendJson(res, 200, { ok: true, status: 'creating', machine: name, distro, template: template || null })
       } catch (err) {
         sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
       }
@@ -3973,6 +3987,8 @@ function builtinTemplates() {
     node: { description: 'Node.js LTS 基础环境', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq curl && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y -qq nodejs npm' },
     docker: { description: 'Docker 环境（VM 内安装 Docker CLI）', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq ca-certificates curl && install -m 0755 -d /etc/apt/keyrings && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list && apt-get update -qq && apt-get install -y -qq docker-ce docker-ce-cli containerd.io' },
     cuda: { description: 'CUDA 基础环境（示例模板，建议按需调整）', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq build-essential linux-headers-$(uname -r) && apt-get install -y -qq nvidia-driver' },
+    webapp: { description: 'Node.js Web 脚手架(git+node+pm2)', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq curl git && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && apt-get install -y -qq nodejs npm && npm i -g pm2' },
+    data: { description: 'Python 数据分析(pandas+git+curl)', distro: 'debian', init_script: 'apt-get update -qq && apt-get install -y -qq python3 python3-pip curl git && python3 -m pip install --quiet pandas numpy requests' },
   }
 }
 
