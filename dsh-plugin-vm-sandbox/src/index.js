@@ -23,6 +23,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join, resolve, sep } from 'node:path'
@@ -36,6 +37,8 @@ const STATE_DIR = join(HOME, '.dsh', 'vm-sandbox')
 const STATE_FILE = join(STATE_DIR, 'state.json')
 const AUDIT_FILE = join(STATE_DIR, 'audit.json')
 const METRICS_FILE = join(STATE_DIR, 'metrics.json')
+const VAULT_FILE = join(STATE_DIR, 'secrets.vault.json')
+const VAULT_KEY_FILE = join(STATE_DIR, 'vault.key')
 const PY_TABLE_FILE = join(STATE_DIR, 'pinyin-initials.json')
 const SAVE_DEBOUNCE_MS = 300
 const CSRF_TTL_MS = 30 * 60 * 1000
@@ -432,9 +435,9 @@ function pushAudit(sessionId, machine, operation, params, ok, error, durationMs)
       sessionId: sessionId || null,
       machine: machine || null,
       operation,
-      params: params || {},
+      params: redactDeep(params || {}, 0),
       ok: !!ok,
-      error: error ? String(error).slice(0, 1000) : null,
+      error: error ? redactVaultText(String(error).slice(0, 1000)) : null,
       durationMs: typeof durationMs === 'number' ? durationMs : null,
     }
     auditStore.push(entry)
@@ -539,7 +542,7 @@ async function createMachineWithName(ctx, sessionId, name, distro, signal, opts)
     if (isolated) args.push('--isolated')
     if (opts.isolateNetwork) args.push('--isolate-network')
     let userDataPath = null
-    const init = String(opts.cloudInit || opts.initScript || '').trim()
+    const init = injectVaultText(String(opts.cloudInit || opts.initScript || '').trim())
     if (init) {
       userDataPath = join(STATE_DIR, 'init-' + name + '-' + Date.now() + '.yml')
       let text = init
@@ -585,6 +588,16 @@ async function createMachineWithName(ctx, sessionId, name, distro, signal, opts)
     saveState()
     await enforceRunningCap(name)
     await ensureNetworkApplied(name)
+    // B1: 默认创建后进行安全基线加固(幂等,失败不阻断创建)
+    if (opts.harden !== false && found && found.state === 'running') {
+      try {
+        await applyHardenBaseline(name)
+        const rec = list.find((r) => r.name === name)
+        if (rec) { rec.security = Object.assign(rec.security || {}, { hardenedAt: Date.now() }); saveState() }
+      } catch (err) {
+        try { console.error('[vmsb] 安全基线加固失败(创建继续), machine=' + name + ' ' + String((err && err.message) || err)) } catch (e) { /* ignore */ }
+      }
+    }
     return { name, distro, state: found ? found.state : 'starting' }
   })()
   inFlight.set(key, task)
@@ -698,6 +711,164 @@ async function removeSessionMachines(sessionId) {
   delete state.machines[sessionId]
   saveState()
   return true
+}
+// ---------- B1: 安全基线 / 加固(vm_harden) ----------
+const HARDEN_SCRIPT = [
+  '#!/bin/sh',
+  '# DSH VM baseline hardening (idempotent, B1)',
+  'set -e',
+  'SSHD=/etc/ssh/sshd_config',
+  'if [ -f "$SSHD" ]; then',
+  '  sed -i "s/^#\\?PasswordAuthentication.*/PasswordAuthentication no/" "$SSHD" 2>/dev/null || true',
+  '  grep -q "^PasswordAuthentication " "$SSHD" || echo "PasswordAuthentication no" >> "$SSHD"',
+  '  sed -i "s/^#\\?PermitRootLogin.*/PermitRootLogin prohibit-password/" "$SSHD" 2>/dev/null || true',
+  '  grep -q "^PermitRootLogin " "$SSHD" || echo "PermitRootLogin prohibit-password" >> "$SSHD"',
+  '  if command -v systemctl >/dev/null 2>&1; then systemctl reload sshd 2>/dev/null || true',
+  '  elif command -v service >/dev/null 2>&1; then (service ssh reload 2>/dev/null || service sshd reload 2>/dev/null) || true',
+  '  elif command -v rc-service >/dev/null 2>&1; then (rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null) || true',
+  '  fi',
+  'fi',
+  'mkdir -p /etc/dsh',
+  'echo "$(date +%s)" > /etc/dsh/hardened-on',
+].join('\n')
+
+const HARDEN_CHECK = [
+  '#!/bin/sh',
+  'if command -v sshd >/dev/null 2>&1; then',
+  '  pa=$(sshd -T 2>/dev/null | sed -n "s/^passwordauthentication[[:space:]]*//p" | head -1 | tr -d "\\r\\n")',
+  '  case "$pa" in no|NO|false|False) echo "ok sshd.password_auth ";; *) [ -n "$pa" ] && echo "fail sshd.password_auth $pa" || echo "na sshd.password_auth undetermined";; esac',
+  '  rl=$(sshd -T 2>/dev/null | sed -n "s/^permitrootlogin[[:space:]]*//p" | head -1 | tr -d "\\r\\n")',
+  '  case "$rl" in no|prohibit-password) echo "ok sshd.root_login ";; *) [ -n "$rl" ] && echo "fail sshd.root_login $rl" || echo "na sshd.root_login undetermined";; esac',
+  '  pgrep -x sshd >/dev/null 2>&1 && echo "ok sshd.running " || echo "fail sshd.running "',
+  'else',
+  '  echo "na sshd.password_auth no-sshd(OrbStack agent,无暴露面)"',
+  '  echo "na sshd.root_login no-sshd(OrbStack agent,无暴露面)"',
+  '  echo "na sshd.running no-sshd(OrbStack agent,无暴露面)"',
+  'fi',
+  'nl=$(ss -tln 2>/dev/null | awk "NR>1 && \\$4 !~ /^(127\\.|::1|\\[::1)/" | wc -l | tr -d " ")',
+  'echo "info listening_nonloopback $nl"',
+  '[ -f /etc/dsh/hardened-on ] && echo "ok baseline_marker " || echo "fail baseline_marker "',
+  'for b in sed awk; do command -v $b >/dev/null 2>&1 && echo "ok bin.$b " || echo "fail bin.$b "; done',
+].join('\n')
+
+function runGuestScript(machine, script, timeoutMs) {
+  const b64 = Buffer.from(script, 'utf8').toString('base64')
+  return orb(['run', '-m', machine, '-u', 'root', 'sh', '-lc', "printf '%s' '" + b64 + "' | base64 -d | sh"], { timeoutMs: timeoutMs || 120000 })
+}
+function parseHardenOutput(stdout, stderr) {
+  const checks = []
+  for (const line of String(stdout || '').split('\n')) {
+    const m = line.match(/^(ok|fail|info|na)\s+(\S+)(?:\s+(.*))?$/)
+    if (m) checks.push({ status: m[1], name: m[2], detail: (m[3] || '').trim() || null })
+  }
+  if (checks.length) return checks
+  return [{ status: 'error', name: 'guest_probe', detail: String(stderr || '').slice(0, 200) || 'orb run 无输出' }]
+}
+async function applyHardenBaseline(machine) {
+  const res = await runGuestScript(machine, HARDEN_SCRIPT, 120000)
+  if (res.exitCode !== 0) throw new Error('加固脚本失败: ' + String(res.stderr || res.stdout || '').slice(0, 300))
+  return true
+}
+async function hardenScan(machine) {
+  const res = await runGuestScript(machine, HARDEN_CHECK, 90000)
+  return parseHardenOutput(res.stdout, res.stderr)
+}
+// ---------- B2: 密钥库(vm_secret, AES-256-GCM at rest) ----------
+let vaultKey = null
+let vaultCache = null
+function loadVaultKey() {
+  if (vaultKey) return vaultKey
+  try {
+    const b = readFileSync(VAULT_KEY_FILE, 'utf8').trim()
+    if (/^[0-9a-f]{64}$/.test(b)) { vaultKey = Buffer.from(b, 'hex'); return vaultKey }
+  } catch (e) { /* 键缺失 → 生成 */ }
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    const k = randomBytes(32)
+    writeFileSync(VAULT_KEY_FILE, k.toString('hex'), { mode: 0o600 })
+    vaultKey = k
+  } catch (e) { vaultKey = null }
+  return vaultKey
+}
+function loadVault() {
+  if (vaultCache) return vaultCache
+  const { data } = readJsonRobust(VAULT_FILE)
+  vaultCache = { version: 1, items: (data && data.items) || {} }
+  return vaultCache
+}
+function saveVault() {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true })
+    atomicWriteJson(VAULT_FILE, vaultCache)
+  } catch (e) { /* ignore */ }
+}
+function vaultEncrypt(plain) {
+  const key = loadVaultKey()
+  if (!key) throw new Error('密钥库不可用(无法读写 vault.key)')
+  const iv = randomBytes(12)
+  const cipher = createCipheriv('aes-256-gcm', key, iv)
+  const enc = Buffer.concat([cipher.update(String(plain == null ? '' : plain), 'utf8'), cipher.final()])
+  return iv.toString('hex') + ':' + cipher.getAuthTag().toString('hex') + ':' + enc.toString('hex')
+}
+function vaultDecrypt(payload) {
+  const key = loadVaultKey()
+  if (!key) return null
+  try {
+    const parts = String(payload || '').split(':')
+    if (parts.length !== 3) return null
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(parts[0], 'hex'))
+    decipher.setAuthTag(Buffer.from(parts[1], 'hex'))
+    return Buffer.concat([decipher.update(Buffer.from(parts[2], 'hex')), decipher.final()]).toString('utf8')
+  } catch (e) { return null }
+}
+function vaultGet(name) {
+  const item = loadVault().items[name]
+  return item ? vaultDecrypt(item.enc) : null
+}
+function vaultSet(name, value, kind) {
+  const vault = loadVault()
+  vault.items[name] = { kind: kind || 'secret', enc: vaultEncrypt(value), updatedAt: Date.now() }
+  saveVault()
+  return true
+}
+function vaultList() {
+  const vault = loadVault()
+  return Object.keys(vault.items).map((n) => ({ name: n, kind: vault.items[n].kind, updatedAt: vault.items[n].updatedAt }))
+}
+function vaultRemove(name) {
+  const vault = loadVault()
+  if (!(name in vault.items)) return false
+  delete vault.items[name]
+  saveVault()
+  return true
+}
+// init_script / cloud_init 内占位符注入({{secret:name}} / {{env:name}})
+function injectVaultText(text) {
+  return String(text || '').replace(/\{\{\s*(secret|env):([a-zA-Z0-9_.-]+)\s*\}\}/g, (m, kind, name) => {
+    const v = vaultGet(name)
+    return v != null ? v : m
+  })
+}
+// 审计/日志脱敏:把命中的密文替换为 ***
+function redactVaultText(text) {
+  let out = String(text || '')
+  for (const entry of vaultList()) {
+    if (entry.kind !== 'secret') continue
+    const v = vaultGet(entry.name)
+    if (v && out.includes(v)) out = out.split(v).join('***')
+  }
+  return out
+}
+function redactDeep(value, depth) {
+  if (depth > 6) return value
+  if (typeof value === 'string') return redactVaultText(value)
+  if (Array.isArray(value)) return value.map((x) => redactDeep(x, depth + 1))
+  if (value && typeof value === 'object') {
+    const o = {}
+    for (const k of Object.keys(value)) o[k] = redactDeep(value[k], depth + 1)
+    return o
+  }
+  return value
 }
 // ---------- 资源治理:全局运行上限 + 闲置自动休眠/回收 + 孤儿清理 ----------
 async function enforceRunningCap(excludeName) {
@@ -2197,6 +2368,7 @@ route('/vmsb-api/network', async (req, res) => {
           template: { type: 'string', description: '可选:模板名(python/node/docker/cuda)、本地 JSON/YAML 路径或 GitHub raw URL。内置模板见 vm_template。' },
           isolated: { type: 'boolean', description: '可选:创建隔离机器(关闭文件共享/集成),使用 OrbStack 官方 --isolated。' },
           isolate_network: { type: 'boolean', description: '可选:启用网络隔离(自动附带 --isolated),使用 OrbStack 官方 --isolate-network。' },
+          harden: { type: 'boolean', description: '可选:创建后应用安全基线(禁 SSH 密码登录/root 仅密钥等),默认 true;false 关闭。' },
         },
       },
       output: OUT,
@@ -2215,6 +2387,7 @@ route('/vmsb-api/network', async (req, res) => {
           cloudInit: args && args.cloud_init,
           isolated: !!(args && args.isolated),
           isolateNetwork: !!(args && args.isolate_network),
+          harden: args && args.harden === false ? false : true,
           templateName: template || null,
         }
         if (template) {
@@ -3263,6 +3436,98 @@ registerTool({
         return { ok: true, machine, services: state.services[machine] }
       },
     })
+
+    registerTool({
+      name: 'vm_harden',
+      description: '查看/应用虚拟机安全基线(B1):operation=scan 检测 sshd 密码登录/root 登录/非回环监听/基础工具/标记;apply 应用加固(禁 SSH 密码登录、root 仅密钥、写入 /etc/dsh/hardened-on);status 显示已加固时间。默认新创建的 VM 自动加固;需要 manage 权限。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['scan', 'apply', 'status'], description: '操作类型,默认 scan。' },
+          machine: { type: 'string', description: '目标机器名称;省略使用当前会话默认机器。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const hint = sanitizeName(args && args.machine)
+        const target = hint ? await resolveExistingMachineByName(ctx, sessionId, hint) : await resolveDefaultMachine(ctx, sessionId)
+        if (!canManage(sessionId, target.name)) throw new Error('没有权限查看/加固该机器(' + target.name + ')')
+        const op = (args && args.operation) || 'scan'
+        const t0 = Date.now()
+        try {
+          if (op === 'scan') {
+            await ensureRunning(target.name)
+            const checks = await hardenScan(target.name)
+            pushAudit(sessionId, target.name, 'vm_harden_scan', {}, true, null, Date.now() - t0)
+            return { ok: true, machine: target.name, operation: 'scan', checks, summary: { pass: checks.filter((c) => c.status === 'ok').length, fail: checks.filter((c) => c.status === 'fail').length, na: checks.filter((c) => c.status === 'na').length } }
+          }
+          if (op === 'apply') {
+            await ensureRunning(target.name)
+            const before = await hardenScan(target.name)
+            await applyHardenBaseline(target.name)
+            const after = await hardenScan(target.name)
+            const rec = recordOfMachine(target.name)
+            if (rec && rec.type === 'machine') { rec.security = Object.assign(rec.security || {}, { hardenedAt: Date.now() }); saveState() }
+            pushAudit(sessionId, target.name, 'vm_harden_apply', {}, true, null, Date.now() - t0)
+            return { ok: true, machine: target.name, operation: 'apply', before, after, hardenedAt: Date.now() }
+          }
+          const rec = recordOfMachine(target.name)
+          return { ok: true, machine: target.name, hardenedAt: rec && rec.type === 'machine' && rec.security ? rec.security.hardenedAt : null }
+        } catch (err) {
+          pushAudit(sessionId, target.name, 'vm_harden_' + op, {}, false, err && err.message || err, Date.now() - t0)
+          throw err
+        }
+      },
+    })
+
+    registerTool({
+      name: 'vm_secret',
+      description: '密钥库(B2):operation=set/get/list/rm。set 以 AES-256-GCM 加密存于 ~/.dsh/vm-sandbox/secrets.vault.json(key 0600);init_script/cloud_init 内用 {{secret:name}} 占位符注入;审计与日志自动对密文脱敏。value 仅 get 返回,不回显到审计。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['set', 'get', 'list', 'rm'], description: '操作类型,默认 list。' },
+          name: { type: 'string', description: '密钥名(字母数字._-)。' },
+          value: { type: 'string', description: 'set 时的明文值(仅允许占位符引用场景使用,不落日志)。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const op = (args && args.operation) || 'list'
+        const name = String((args && args.name) || '').trim()
+        try {
+          if (op === 'set') {
+            if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) throw new Error('name 仅允许字母数字._-(<=64)')
+            if (args === null || args === undefined || args.value === undefined || args.value === null) throw new Error('value 不能为空')
+            vaultSet(name, String(args.value), 'secret')
+            pushAudit(sessionId, null, 'vm_secret_set', { name }, true, null)
+            return { ok: true, name, set: true }
+          }
+          if (op === 'get') {
+            if (!name) throw new Error('缺少 name')
+            const v = vaultGet(name)
+            if (v === null) throw new Error('未找到密钥或解密失败: ' + name)
+            pushAudit(sessionId, null, 'vm_secret_get', { name }, true, null)
+            return { ok: true, name, value: v }
+          }
+          if (op === 'rm') {
+            if (!name) throw new Error('缺少 name')
+            const removed = vaultRemove(name)
+            pushAudit(sessionId, null, 'vm_secret_rm', { name }, true, null)
+            return { ok: true, name, removed }
+          }
+          pushAudit(sessionId, null, 'vm_secret_list', {}, true, null)
+          return { ok: true, secrets: vaultList().map((s) => ({ name: s.name, kind: s.kind, updatedAt: s.updatedAt })) }
+        } catch (err) {
+          pushAudit(sessionId, null, 'vm_secret_' + op, { name }, false, redactVaultText(String((err && err.message) || err)))
+          throw err
+        }
+      },
+    })
   }
 
   try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.3.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
@@ -3282,6 +3547,11 @@ export const __vmsb = {
   normalizeMachines,
   canOwner, canExec, canManage, shareMode,
   ALLOWLIST_RE, STATE_DIR, AUDIT_FILE, METRICS_FILE,
+  // B1 / B2 测试接缝
+  HARDEN_SCRIPT, HARDEN_CHECK, parseHardenOutput,
+  VAULT_FILE, VAULT_KEY_FILE,
+  vaultEncrypt, vaultDecrypt, vaultSet, vaultGet, vaultList, vaultRemove,
+  injectVaultText, redactVaultText, redactDeep,
 }
 // ---- 模板库 ----
 function builtinTemplates() {
