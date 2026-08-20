@@ -2340,10 +2340,58 @@ route('/vmsb-api/snapshots', async (req, res) => {
       })
       route('/vmsb-api/cron', async (req, res) => {
         try {
+          const isPost = !!(req.method && String(req.method).toUpperCase() === 'POST')
+          const body = isPost ? await gate(req, res, { method: 'POST', token: true }) : await gate(req, res, { method: 'GET' })
+          if (body === null) return
+          const q = pFrom(req, isPost ? body : {})
+          const sessionId = q.get('session') || ''
+          if (!isPost) {
+            const list = (state.cron || []).filter((c) => !sessionId || c.sessionId === sessionId)
+            sendJson(res, 200, { ok: true, jobs: list })
+            return
+          }
+          // D2: 面板调度 UI 的 cron 管理(add/toggle/remove)
+          const action = q.get('action') || 'add'
+          if (action === 'add') {
+            const machine = sanitizeName(q.get('machine'))
+            const command = String(q.get('command') || '').trim()
+            const expr = String(q.get('expr') || '').trim()
+            if (!sessionId || !machine || !command || expr.split(/\s+/).length !== 5) throw new Error('需要 session/machine/command/5 字段 expr')
+            const id = genId('cron')
+            state.cron = state.cron || []
+            state.cron.push({ id, name: String(q.get('name') || '').trim() || id, sessionId, machine, command, expr, enabled: q.get('enabled') !== '0', createdAt: Date.now(), nextRunAt: nextCronRun(expr, new Date())?.getTime() || null })
+            saveState()
+            pushAudit(sessionId, machine, 'vm_cron_add', { id, expr }, true, null)
+            sendJson(res, 200, { ok: true, job: state.cron.find((c) => c.id === id) })
+          } else if (action === 'toggle') {
+            const name = String(q.get('name') || '').trim()
+            const job = (state.cron || []).find((c) => c.sessionId === sessionId && (c.id === name || c.name === name))
+            if (!job) throw new Error('未找到定时任务')
+            job.enabled = !job.enabled
+            saveState()
+            pushAudit(sessionId, job.machine, 'vm_cron_toggle', { id: job.id, enabled: job.enabled }, true, null)
+            sendJson(res, 200, { ok: true, job: { ...job } })
+          } else if (action === 'remove') {
+            const name = String(q.get('name') || '').trim()
+            const idx = (state.cron || []).findIndex((c) => c.sessionId === sessionId && (c.id === name || c.name === name))
+            if (idx < 0) throw new Error('未找到定时任务')
+            const [job] = state.cron.splice(idx, 1)
+            saveState()
+            pushAudit(sessionId, job.machine, 'vm_cron_remove', { id: job.id }, true, null)
+            sendJson(res, 200, { ok: true, removed: job })
+          } else {
+            throw new Error('不支持的 action: ' + action)
+          }
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/report', async (req, res) => {
+        try {
           const q = queryOf(req)
           const sessionId = q.get('session') || ''
-          const list = (state.cron || []).filter((c) => !sessionId || c.sessionId === sessionId)
-          sendJson(res, 200, { ok: true, jobs: list })
+          if (!sessionId) throw new Error('缺少会话标识')
+          sendJson(res, 200, aggregateReport(sessionId, sanitizeName(q.get('machine') || '')))
         } catch (err) {
           sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
         }
@@ -3957,6 +4005,23 @@ registerTool({
         return { ok: true, queue: q.map((x, i) => ({ id: x.id, position: i + 1, status: x.status, distro: x.req && x.req.distro, cpus: x.req && x.req.cpus, memory: x.req && x.req.memory, createdAt: x.createdAt, machine: x.machine || null, error: x.error || null })) }
       },
     })
+
+    registerTool({
+      name: 'vm_report',
+      description: '用量报表(D2):汇总本会话各机型/整会话的平均 CPU%/内存%、规格(核/内存)、采样跨度、累计创建数、排队数。machine 给定时只看该机。',
+      parameters: {
+        type: 'object',
+        properties: {
+          machine: { type: 'string', description: '可选:只看单机。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        return aggregateReport(sessionId, sanitizeName(args && args.machine))
+      },
+    })
   }
 
   try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.3.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
@@ -3982,11 +4047,13 @@ export const __vmsb = {
   vaultEncrypt, vaultDecrypt, vaultSet, vaultGet, vaultList, vaultRemove,
   injectVaultText, redactVaultText, redactDeep,
   // C1 增强指标/告警测试接缝
-  parseProbeOutput, metricValueOf, evalAlert, sampleAllMetrics, evaluateAlerts, metricsView, PROBE_CMD,
+  parseProbeOutput, metricValueOf, evalAlert, sampleAllMetrics, evaluateAlerts, metricsView, PROBE_CMD, metricsStore,
   // D4 配额/排队测试接缝
   state, quotaState, sessionResourceUsage, sessionPolicy, processQueuedCreations,
   // D3 分片导出测试接缝
   sliceFileByChunks,
+  // D2 用量报表测试接缝
+  aggregateReport,
 }
 // ---- 模板库 ----
 function builtinTemplates() {
@@ -4155,6 +4222,33 @@ function metricsView(name, limit) {
   const list = metricsStore.get(name) || []
   const n = Math.max(1, Number(limit) || 120)
   return { ok: true, machine: name, metrics: list.slice(-n).map((p) => ({ ...p })) }
+}
+
+// D2: 用量报表聚合(会话级 / 单机)
+function aggregateReport(sessionId, machineName) {
+  const src = machineName ? sessionMachines(sessionId).filter((r) => r.name === machineName) : sessionMachines(sessionId)
+  const rows = src.map((rec) => {
+    const pts = metricsStore.get(rec.name) || []
+    const memVals = pts.map((p) => (p.memory && p.memory.totalBytes ? (1 - (p.memory.availableBytes || 0) / p.memory.totalBytes) * 100 : null)).filter((v) => v !== null && Number.isFinite(v))
+    const cpuVals = pts.map((p) => p.cpuPercent).filter((v) => typeof v === 'number')
+    const avg = (a) => (a.length ? Math.round((a.reduce((s, v) => s + v, 0) / a.length) * 10) / 10 : null)
+    return {
+      name: rec.name,
+      distro: rec.distro,
+      cpus: Number((rec.spec && rec.spec.cpus)) || 2,
+      memoryMiB: sizeToMiB(rec.spec && rec.spec.memory) || 2048,
+      createdAt: rec.createdAt,
+      lastUsedAt: rec.lastUsedAt || rec.createdAt || 0,
+      samplePoints: pts.length,
+      avgCpuPct: avg(cpuVals),
+      avgMemPct: avg(memVals),
+      sampledSpanMs: pts.length >= 2 ? pts[pts.length - 1].ts - pts[0].ts : 0,
+    }
+  })
+  const totals = rows.reduce((a, r) => { a.machines++; a.cpus += r.cpus; a.memoryMiB += r.memoryMiB; return a }, { machines: 0, cpus: 0, memoryMiB: 0 })
+  const createdTotal = auditStore.filter((a) => a.operation === 'vm_create' && a.ok && a.sessionId === sessionId).length
+  const queueSize = (state.queue && state.queue[sessionId] && state.queue[sessionId].length) || 0
+  return { ok: true, sessionId, machine: machineName || null, rows, totals, createdTotal, queueSize }
 }
 
 // ---- 热调整资源 ----

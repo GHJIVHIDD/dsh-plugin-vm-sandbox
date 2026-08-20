@@ -264,7 +264,8 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 						api("cron", { session: sessionId }),
 						api("templates", {}),
 						api("policy", { session: sessionId }),
-					]).then(async ([svc, cron, tpl, pol]) => {
+						api("report", { session: sessionId }),
+					]).then(async ([svc, cron, tpl, pol, rpt]) => {
 						const machines = svc.machines || [];
 						const metrics = {};
 						const net = {};
@@ -287,7 +288,7 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 								if (r && r.ok) shares[m.name] = r.sharedWith || [];
 							} catch (e) { /* ignore */ }
 						}));
-						setMeta({ svc: machines, cron: cron.jobs || [], tpl: tpl.templates || [], pol: pol.policy, metrics, net, shares });
+						setMeta({ svc: machines, cron: cron.jobs || [], tpl: tpl.templates || [], pol: pol.policy, metrics, net, shares, report: (rpt && rpt.ok) ? rpt : null });
 					}, (e) => setError(String((e && e.message) || e)));
 				}
 			}, [sessionId]);
@@ -676,6 +677,36 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 						);
 					});
 					const reloadMeta = () => loadTab("meta");
+					// D2: 定时任务管理
+					const cronMgmt = {
+						toggle: (cid) => apiPost("cron", { action: "toggle", session: sessionId, name: cid }).then(reloadMeta, (e) => setError(String((e && e.message) || e))),
+						remove: (cid) => apiPost("cron", { action: "remove", session: sessionId, name: cid }).then(reloadMeta, (e) => setError(String((e && e.message) || e))),
+						add: () => {
+							const machine = window.prompt("目标机器(留空=默认)");
+							const expr = window.prompt("cron 表达式(5 字段,如 */10 * * * *)");
+							if (!expr) return;
+							const command = window.prompt("要定时执行的命令");
+							if (!command) return;
+							apiPost("cron", { action: "add", session: sessionId, machine: machine || "", expr, command, name: "ui" }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+						},
+					};
+					const cronRows = (meta.cron || []).map((c) => React.createElement("div", { key: "cron-" + c.id, className: "vmsb-item" },
+						React.createElement("div", { className: "vmsb-row" },
+							React.createElement("span", { className: "vmsb-name" }, c.name || c.id),
+							React.createElement("span", { className: "vmsb-meta" }, c.machine + " · " + c.expr),
+							React.createElement("span", { className: "vmsb-owner" }, c.enabled ? "启用" : "已停"),
+							panelButton(() => cronMgmt.toggle(c.id), c.enabled ? "停用" : "启用"),
+							panelButton(() => cronMgmt.remove(c.id), "删除", true),
+						),
+					));
+					// D2: 用量报表
+					const rptRows = (meta.report && meta.report.rows || []).map((r) => React.createElement("div", { key: "rpt-" + r.name, className: "vmsb-item" },
+						React.createElement("div", { className: "vmsb-row" },
+							React.createElement("span", { className: "vmsb-name" }, r.name),
+							React.createElement("span", { className: "vmsb-meta" }, r.cpus + " 核 / " + (r.memoryMiB / 1024) + " GB"),
+							React.createElement("span", { className: "vmsb-owner" }, "CPU " + (r.avgCpuPct == null ? "—" : r.avgCpuPct + "%") + " · 内存 " + (r.avgMemPct == null ? "—" : r.avgMemPct + "%")),
+						),
+					));
 					const netRows = (meta.svc || []).map((m) => {
 						const p = (meta.net || {})[m.name] || {};
 						const sh = (meta.shares || {})[m.name] || [];
@@ -702,6 +733,13 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 					});
 					return React.createElement("div", { className: "vmsb-list" },
 						items.map((t, i) => React.createElement("div", { key: i, className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, t)))),
+						meta.report ? React.createElement("div", { key: "rep-header", className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, "用量报表: " + meta.report.totals.machines + " 台 / CPU " + meta.report.totals.cpus + " 核 / 内存 " + Math.round(meta.report.totals.memoryMiB / 1024) + " GB · 累计创建 " + meta.report.createdTotal + (meta.report.queueSize ? " · 排队 " + meta.report.queueSize : "")))) : null,
+						...rptRows,
+						React.createElement("div", { key: "cron-header", className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" },
+							React.createElement("span", { className: "vmsb-meta" }, "定时任务"),
+							panelButton(cronMgmt.add, "＋ 新增"),
+						)),
+						...cronRows,
 						netRows.length ? React.createElement("div", { key: "netheader", className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, "网络开关"))) : null,
 						...netRows,
 						metricBars.length ? React.createElement("div", { key: "metrics", className: "vmsb-item" }, React.createElement("div", { className: "vmsb-row" }, React.createElement("span", { className: "vmsb-meta" }, "指标趋势(内存使用率)"))) : null,
