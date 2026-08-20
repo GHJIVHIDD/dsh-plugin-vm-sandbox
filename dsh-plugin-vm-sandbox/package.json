@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
-  "version": "0.3.0",
-  "description": "OrbStack VM sandbox v0.3.0: retained v0.2 capability + panel API hardening (POST/same-origin/CSRF token), allowlist shell-injection guard, atomic state writes with .bak fallback, debounced + partitioned persistence (audit.json/metrics.json), workspace-restricted template reads, unit-test skeleton.",
+  "version": "0.4.0",
+  "description": "OrbStack VM sandbox v0.4.0: + 交互终端(A1)、场景化一键创建(A3)、删除撤销+通知(A4)、配额可见(A5)、协作分组(A6)、安全基线 vm_harden(B1)、密钥库 vm_secret(B2)、增强指标+告警 vm_alert(C1)、vm_scp/vm_logs/vm_env/vm_withdraw(D1)、调度UI+报表 vm_report(D2)、导出分片/远端(D3)、累计配额+排队(D4)。",
   "type": "module",
   "scripts": {
     "prepare": "node ./scripts/prepare.mjs"

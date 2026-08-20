@@ -2,9 +2,24 @@
 
 DeepSeek Harness 的**虚拟机沙箱**（Web 部署级插件）。
 
-在会话视图环中新增「虚拟机」页签，为每个会话提供 OrbStack 沙箱虚拟机（debian/alpine，同一会话必要时可多台）。状态持久化在 `~/.dsh/vm-sandbox/`（`state.json` + `audit.json` + `metrics.json`）。
+在会话视图环中新增「虚拟机」页签，为每个会话提供 OrbStack 沙箱虚拟机（debian/alpine，同一会话必要时可多台）。状态持久化在 `~/.dsh/vm-sandbox/`（`state.json` + `audit.json` + `metrics.json` + `secrets.vault.json`）。
 
-## 功能（v0.3.0）
+## 功能（v0.4.0）
+
+### v0.4.0 增强：体验 · 安全 · 编排 · 完整
+
+- **A1 交互式 Web 终端**：机器详情内嵌 xterm.js 终端（CDN 按需加载），基于 OrbStack `orb run -s` 交互 shell，输出走 SSE 流、输入回传走 POST（复用 CSRF 通道）；空闲自动回收。
+- **A3 场景化一键创建**：面板「快速开始」卡片一键出「就绪环境」（基础 / Python 分析 / Node 服务 / Web 脚手架 / Docker in VM）；`/vmsb-api/create` 支持 `template`。
+- **A4 大动作可撤销 + 完成通知**：面板删除默认先打 `undo-before-delete` 快照，一键「撤销删除」恢复；VM 创建完成、指标告警触发以 toast 通知。
+- **A5 配额一眼可见**：面板顶部配额进度条（机器 / CPU / 内存 用量·限额）+ 排队数。
+- **A6 多会话协作分组视图**：机器列表按「本会话 / 共享给我 / 其他会话」分组，来源徽标。
+- **B1 创建即安全基线 + `vm_harden`**：新 VM 默认加固（禁 SSH 密码登录 / root 仅密钥 + 标记）；scan/apply/status；OrbStack 无 sshd 时自适应 `na`。
+- **B2 密钥库 `vm_secret`**：AES-256-GCM 加密存 `secrets.vault.json`（key 0600）；`{{secret:name}}`/`{{env:name}}` 占位符注入 init 脚本；审计/日志自动脱敏。
+- **C1 增强指标 + 阈值告警 `vm_alert`**：每核 CPU% / 网络 / IO 速率 / 进程 Top（相邻采样差分）；阈值规则（cpu|mem|disk|load|netRx|netTx|io，gt|gte|lt|lte|eq，冷却）命中即审计 + `/vmsb-api/alerts` 通知。
+- **D1 补工具**：`vm_scp`（批量/多机分发）、`vm_logs`（统一日志）、`vm_env`（环境变量库）、`vm_withdraw`（安全下线：停任务/停隧道/撤销共享/可选快照/删除）。
+- **D2 调度 UI + 用量报表 `vm_report`**：meta 页签定时任务管理（增/启停/删）；会话级用量报表（机型平均 CPU%/内存%、规格、采样跨度、累计创建、排队）。
+- **D3 导出分片/远端**：`vm_export slice_mb` 分片到 `<path>.parts/`（可无损拼接）；`remote_machine` 推到另一台 VM 备份。
+- **D4 累计配额 + 创建排队**：`vm_policy cpu_quota/memory_quota`；`vm_create(queue:true)` 超配额排队，配额释放自动推进（`vm_queue` 查看/取消）。
 
 ### v0.3.0 增强：安全与可靠性
 
