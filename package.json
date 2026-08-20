@@ -1,11 +1,12 @@
 {
   "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
-  "version": "0.2.1",
-  "description": "OrbStack VM sandbox v0.2.0: web UI tabs (snapshots/jobs/audit/network), cron tasks, auto snapshot policies, template library, hot resize, export/import, metrics history, multi-machine groups/fail-fast, network allowlist and service discovery.",
+  "version": "0.3.0",
+  "description": "OrbStack VM sandbox v0.3.0: v0.2 全部能力 + 面板 API 加固(S1 同源/POST/CSRF)、allowlist 注入防护(S2)、原子写入备份回退(R1)、模板路径限制(S3)、保存去抖与 audit/metrics 独立存储(R2)、node:test 单元测试骨架(R5).",
   "type": "module",
   "scripts": {
     "prepare": "node ./scripts/prepare.mjs",
     "verify": "node scripts/verify.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
     "smoke": "node scripts/smoke.mjs",
     "e2e": "node scripts/e2e.mjs",
     "ui-test": "node scripts/ui-test.mjs"

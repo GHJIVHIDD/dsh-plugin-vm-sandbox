@@ -1,7 +1,8 @@
 /**
  * Host loader entry for the deployment-level VM sandbox plugin.
  *
- * v0.2.1 upgrade — adds Web UI tabs, cron, auto snapshots, templates, resize, export/import, metrics, groups/fail-fast, network allowlist and service discovery:
+ * v0.3.0 upgrade — panel API hardening (same-origin + POST-only mutations + per-session CSRF token), allowlist shell-injection guard, atomic state writes with .bak fallback, workspace-restricted template reads, debounced + partitioned persistence (audit.json / metrics.json), and a node:test unit-test seam (__vmsb):
+ *  Also retains all v0.2.1 capability:
  *   1. 快照与回滚 vm_snapshot / vm_restore / vm_snapshot_delete / vm_snapshot_list
  *   2. 文件传输 vm_upload / vm_download (OrbStack official orb push/pull)
  *   3. 生命周期管理 vm_start / vm_stop / vm_restart / vm_status
@@ -22,7 +23,7 @@
  */
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { join, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
@@ -33,7 +34,11 @@ const ORB = '/usr/local/bin/orb'
 const HOME = process.env.HOME || ''
 const STATE_DIR = join(HOME, '.dsh', 'vm-sandbox')
 const STATE_FILE = join(STATE_DIR, 'state.json')
+const AUDIT_FILE = join(STATE_DIR, 'audit.json')
+const METRICS_FILE = join(STATE_DIR, 'metrics.json')
 const PY_TABLE_FILE = join(STATE_DIR, 'pinyin-initials.json')
+const SAVE_DEBOUNCE_MS = 300
+const CSRF_TTL_MS = 30 * 60 * 1000
 
 const MAX_RUNNING = 25
 const MAX_PER_SESSION = 8
@@ -76,38 +81,123 @@ function normalizeMachines(raw) {
   return out
 }
 function loadStateFile() {
+  let parsed = null
+  let recovered = false
   try {
-    const parsed = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
-    if (parsed && typeof parsed === 'object' && parsed.machines && typeof parsed.machines === 'object') {
-      return {
-        version: 3,
-        machines: normalizeMachines(parsed.machines),
-        snapshots: parsed.snapshots && typeof parsed.snapshots === 'object' ? parsed.snapshots : {},
-        shares: parsed.shares && typeof parsed.shares === 'object' ? parsed.shares : {},
-        policies: parsed.policies && typeof parsed.policies === 'object' ? parsed.policies : {},
-        network: parsed.network && typeof parsed.network === 'object' ? parsed.network : {},
-        jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
-        tunnels: Array.isArray(parsed.tunnels) ? parsed.tunnels : [],
-        audit: Array.isArray(parsed.audit) ? parsed.audit : [],
-        cron: Array.isArray(parsed.cron) ? parsed.cron : [],
-        templates: parsed.templates && typeof parsed.templates === 'object' ? parsed.templates : {},
-        metrics: parsed.metrics && typeof parsed.metrics === 'object' ? parsed.metrics : {},
-        services: parsed.services && typeof parsed.services === 'object' ? parsed.services : {},
-      }
-    }
-  } catch (e) { /* 缺失或损坏时使用空状态 */ }
-  return { version: 4, machines: {}, snapshots: {}, shares: {}, policies: {}, network: {}, jobs: [], tunnels: [], audit: [], cron: [], templates: {}, metrics: {}, services: {} }
+    parsed = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+  } catch (e) {
+    // 主文件缺失或损坏:尝试从 .bak 回退
+    try {
+      parsed = JSON.parse(readFileSync(STATE_FILE + '.bak', 'utf8'))
+      recovered = true
+    } catch (e2) { parsed = null }
+  }
+  const empty = { version: 4, machines: {}, snapshots: {}, shares: {}, policies: {}, network: {}, jobs: [], tunnels: [], cron: [], templates: {}, services: {} }
+  if (!parsed || typeof parsed !== 'object' || !parsed.machines || typeof parsed.machines !== 'object') {
+    return { core: empty, legacy: { audit: [], metrics: {} } }
+  }
+  if (recovered) {
+    try { console.error('[vmsb] state.json 损坏,已从 state.json.bak 回退') } catch (e) { /* ignore */ }
+  }
+  return {
+    core: {
+      version: 4,
+      machines: normalizeMachines(parsed.machines),
+      snapshots: parsed.snapshots && typeof parsed.snapshots === 'object' ? parsed.snapshots : {},
+      shares: parsed.shares && typeof parsed.shares === 'object' ? parsed.shares : {},
+      policies: parsed.policies && typeof parsed.policies === 'object' ? parsed.policies : {},
+      network: parsed.network && typeof parsed.network === 'object' ? parsed.network : {},
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+      tunnels: Array.isArray(parsed.tunnels) ? parsed.tunnels : [],
+      cron: Array.isArray(parsed.cron) ? parsed.cron : [],
+      templates: parsed.templates && typeof parsed.templates === 'object' ? parsed.templates : {},
+      services: parsed.services && typeof parsed.services === 'object' ? parsed.services : {},
+    },
+    legacy: {
+      audit: Array.isArray(parsed.audit) ? parsed.audit : [],
+      metrics: parsed.metrics && typeof parsed.metrics === 'object' ? parsed.metrics : {},
+    },
+  }
 }
-let state = loadStateFile()
+
+// ---- 原子写入 + 备份回退 ----
+function atomicWriteJson(file, obj) {
+  const tmp = file + '.tmp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+  const text = JSON.stringify(obj)
+  writeFileSync(tmp, text, 'utf8')
+  try {
+    if (existsSync(file)) copyFileSync(file, file + '.bak')
+  } catch (e) { /* 备份失败不影响主写 */ }
+  try {
+    renameSync(tmp, file)
+  } catch (e) {
+    try { rmSync(tmp, { force: true }) } catch (e2) { /* ignore */ }
+    throw e
+  }
+}
+function readJsonRobust(file) {
+  for (const f of [file, file + '.bak']) {
+    try {
+      return { data: JSON.parse(readFileSync(f, 'utf8')), recovered: f !== file }
+    } catch (e) { /* 尝试下一个候选 */ }
+  }
+  return { data: null, recovered: false }
+}
+
+const loadedState = loadStateFile()
+let state = loadedState.core
+
+// ---- 独立存储:审计 / 指标(从主 state.json 拆出,避免文件无限膨胀与频繁整写) ----
+let auditStore = []
+let metricsStore = new Map()
+function loadAuditStore() {
+  const { data } = readJsonRobust(AUDIT_FILE)
+  return Array.isArray(data) ? data : []
+}
+function loadMetricsStore() {
+  const { data } = readJsonRobust(METRICS_FILE)
+  return data && typeof data === 'object' && !Array.isArray(data) ? data : {}
+}
+function migrateLegacySplits(legacyAudit, legacyMetrics) {
+  try {
+    if (Array.isArray(legacyAudit) && legacyAudit.length > 0 && !existsSync(AUDIT_FILE)) atomicWriteJson(AUDIT_FILE, legacyAudit)
+  } catch (e) { /* ignore */ }
+  try {
+    if (legacyMetrics && typeof legacyMetrics === 'object' && Object.keys(legacyMetrics).length > 0 && !existsSync(METRICS_FILE)) atomicWriteJson(METRICS_FILE, legacyMetrics)
+  } catch (e) { /* ignore */ }
+}
+migrateLegacySplits(loadedState.legacy.audit, loadedState.legacy.metrics)
+auditStore = loadAuditStore()
+metricsStore = new Map(Object.entries(loadMetricsStore()))
+
 let knownArchived = new Set()
 const inFlight = new Map()
 const shellLogs = new Map()
+const csrfTokens = new Map()
 let sweeping = false
 
-function saveState() {
+// ---- 保存:去抖 + 汇聚,单点控制原子性 ----
+let dirty = false
+let saveTimer = null
+function saveState() { scheduleSave() }
+function scheduleSave() {
+  dirty = true
+  if (saveTimer !== null) return
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    flushStateNow()
+  }, SAVE_DEBOUNCE_MS)
+  if (saveTimer && typeof saveTimer.unref === 'function') saveTimer.unref()
+}
+function flushStateNow() {
+  if (!dirty) return
+  dirty = false
+  if (saveTimer !== null) { clearTimeout(saveTimer); saveTimer = null }
   try {
     mkdirSync(STATE_DIR, { recursive: true })
-    writeFileSync(STATE_FILE, JSON.stringify(state))
+    atomicWriteJson(STATE_FILE, state)
+    atomicWriteJson(AUDIT_FILE, auditStore)
+    atomicWriteJson(METRICS_FILE, Object.fromEntries(metricsStore))
   } catch (e) {
     try { console.error('[vmsb] state save failed:', e && e.message || e) } catch (e2) { /* ignore */ }
   }
@@ -347,8 +437,8 @@ function pushAudit(sessionId, machine, operation, params, ok, error, durationMs)
       error: error ? String(error).slice(0, 1000) : null,
       durationMs: typeof durationMs === 'number' ? durationMs : null,
     }
-    state.audit.push(entry)
-    if (state.audit.length > MAX_AUDIT) state.audit.splice(0, state.audit.length - MAX_AUDIT)
+    auditStore.push(entry)
+    if (auditStore.length > MAX_AUDIT) auditStore.splice(0, auditStore.length - MAX_AUDIT)
     saveState()
     return entry
   } catch (e) {
@@ -357,7 +447,7 @@ function pushAudit(sessionId, machine, operation, params, ok, error, durationMs)
 }
 
 function auditView(ctx, filter, limit) {
-  const rows = state.audit.slice().reverse().filter((a) => {
+  const rows = auditStore.slice().reverse().filter((a) => {
     if (filter && filter.sessionId && a.sessionId !== filter.sessionId) return false
     if (filter && filter.machine && a.machine !== filter.machine) return false
     if (filter && filter.operation && a.operation !== filter.operation) return false
@@ -567,6 +657,7 @@ async function deleteMachineByName(name) {
   const res = await orb(['delete', '-f', name], { timeoutMs: 180000 })
   if (res.exitCode === 0) {
     shellLogs.delete(name)
+    metricsStore.delete(name)
     stopMachineTunnels(name)
     invalidateMachineJobs(name)
   }
@@ -798,6 +889,7 @@ async function restoreSnapshot(ctx, sessionId, snapshotName) {
       throw new Error('恢复前删除当前机器失败: ' + String(del.stderr || del.stdout || '').slice(0, 300))
     }
     shellLogs.delete(srcName)
+    metricsStore.delete(srcName)
   }
   const cl = await orb(['clone', snapshotName, srcName], { timeoutMs: 900000 })
   if (cl.exitCode !== 0) {
@@ -1290,9 +1382,26 @@ async function ensureNetworkApplied(name) {
   await applyNetworkPolicyToMachine(name)
 }
 
+const ALLOWLIST_RE = /^[0-9a-zA-Z.:\-_/]+$/
+function validateAllowlist(entries) {
+  const out = []
+  for (const raw of entries || []) {
+    if (raw === null || raw === undefined) continue
+    const item = String(raw).trim()
+    if (!item) continue
+    if (item.length > 253 || !ALLOWLIST_RE.test(item)) {
+      throw new Error('allowlist 仅支持 IP / CIDR / 域名(仅允许字母数字 . : - _ /),非法项: ' + item.slice(0, 40))
+    }
+    out.push(item)
+  }
+  return out
+}
+
 async function applyNetworkPolicyToMachine(name) {
   const p = state.network[name]
   if (!p) return
+  // 二次校验(纵深防御):即使策略已被写入,应用前也拒绝注入 shell 的项
+  const allowlist = validateAllowlist(p.allowlist || [])
   const m = await machineStateOf(name)
   if (!m || m.state !== 'running') return
   const publicAccess = p.publicAccess !== false
@@ -1312,7 +1421,7 @@ async function applyNetworkPolicyToMachine(name) {
     "GW=$(ip route | awk '/default/{print $3; exit}')",
     "[ -n \"$GW\" ] && iptables -A DSH_VM -d \"$GW\" -j RETURN && iptables -A DSH_VM -s \"$GW\" -j RETURN",
   ]
-  for (const item of (p.allowlist || [])) {
+  for (const item of allowlist) {
     if (/[a-zA-Z]/.test(item)) {
       script.push("H=$(getent ahostsv4 " + item + " 2>/dev/null | awk 'NR==1{print $1}'); [ -n \"$H\" ] && iptables -A DSH_VM -d \"$H\" -j RETURN && iptables -A DSH_VM -s \"$H\" -j RETURN")
     } else {
@@ -1359,7 +1468,7 @@ async function setNetworkPolicy(ctx, sessionId, machineName, publicAccess, inter
   if (isolated !== undefined) p.isolated = !!isolated
   if (isolateNetwork !== undefined) p.isolateNetwork = !!isolateNetwork
   if (p.isolateNetwork) p.isolated = true
-  if (Array.isArray(allowlist)) p.allowlist = allowlist.map((x) => String(x).trim()).filter(Boolean)
+  if (Array.isArray(allowlist)) p.allowlist = validateAllowlist(allowlist)
   p.updatedAt = now
   p.appliedAt = null
   saveState()
@@ -1526,6 +1635,86 @@ function sendJson(res, status, obj) {
   } catch (e) { /* ignore */ }
 }
 
+// ---------- 面板 API 加固(S1):同源校验 + CSRF token 绑定 session ----------
+const ALLOWED_SFS = new Set(['same-origin', 'none'])
+function sameOriginOk(req) {
+  const headers = req.headers || {}
+  const sfs = headers['sec-fetch-site']
+  if (typeof sfs === 'string' && sfs !== '' && !ALLOWED_SFS.has(sfs)) return false
+  const origin = headers.origin
+  if (!origin) return true
+  try {
+    const o = new URL(origin)
+    const host = String(headers.host || '').toLowerCase()
+    const m = host.match(/^([^:]+)(?::(\d+))?$/)
+    if (!m) return false
+    const oPort = o.port || (o.protocol === 'https:' ? '443' : '80')
+    const hPort = m[2] || (o.protocol === 'https:' ? '443' : '80')
+    return o.hostname.toLowerCase() === m[1] && oPort === hPort
+  } catch (e) { return false }
+}
+function checkCsrf(sid, header) {
+  const rec = csrfTokens.get(sid)
+  if (!rec) return false
+  if (rec.exp < Date.now()) { csrfTokens.delete(sid); return false }
+  return !!header && String(header) === rec.token
+}
+function readJsonBody(req, maxBytes) {
+  const limit = maxBytes || 1024 * 1024
+  return new Promise((resolve, reject) => {
+    if (req.body !== undefined) return resolve(req.body === null || req.body === '' ? {} : req.body)
+    const chunks = []
+    let size = 0
+    let settled = false
+    const cleanup = () => { if (req.removeListener) { req.removeListener('data', onData); req.removeListener('end', onEnd); req.removeListener('error', onError) } }
+    const fail = (e) => { if (settled) return; settled = true; cleanup(); reject(e) }
+    const onData = (c) => { size += c.length; if (size > limit) { fail(new Error('请求体过大')) } else { chunks.push(c) } }
+    const onEnd = () => { if (settled) return; settled = true; cleanup(); try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {}) } catch (e) { reject(new Error('请求体 JSON 解析失败')) } }
+    const onError = (e) => fail(e || new Error('请求中断'))
+    req.on('data', onData)
+    req.on('end', onEnd)
+    req.on('error', onError)
+  })
+}
+// 统一闸门:校验方法 / 同源 / CSRF;POST 时解析 JSON body。任一校验失败 sendJson 并返回 null。
+async function gate(req, res, opts) {
+  const method = (opts && opts.method) || 'GET'
+  const needToken = !!(opts && opts.token)
+  if (req.method && String(req.method).toUpperCase() !== method) {
+    sendJson(res, 405, { ok: false, error: 'method not allowed (expect ' + method + ')' })
+    return null
+  }
+  if (!sameOriginOk(req)) {
+    sendJson(res, 403, { ok: false, error: 'cross-origin request rejected' })
+    return null
+  }
+  let body = {}
+  if (method === 'POST') {
+    try { body = await readJsonBody(req) } catch (e) { sendJson(res, 400, { ok: false, error: String((e && e.message) || e) }); return null }
+  }
+  if (needToken) {
+    const sid = String(body && body.session != null ? body.session : (queryOf(req).get('session') || '')).trim()
+    if (!checkCsrf(sid, (req.headers || {})['x-vmsb-token'])) {
+      sendJson(res, 403, { ok: false, error: '缺少或无效的 CSRF token(请先 GET /vmsb-api/token?session=... 并回传 X-VMSB-Token 头)' })
+      return null
+    }
+  }
+  return body
+}
+// 合并 POST body 与 GET query,保持既有 handler 用 URLSearchParams 读取的方式不变
+function pFrom(req, body) {
+  const q = queryOf(req)
+  const out = new URLSearchParams(q.toString())
+  if (body && typeof body === 'object') {
+    for (const k of Object.keys(body)) {
+      const v = body[k]
+      if (v === undefined || v === null) continue
+      out.set(k, Array.isArray(v) ? v.join(',') : String(v))
+    }
+  }
+  return out
+}
+
 // ---------- 模型工具 ----------
 const render = (args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
 const sessionIdOf = (exec) => (exec && exec.agent ? exec.agent.id : null)
@@ -1592,6 +1781,12 @@ function apply(ctx) {
       }, METRICS_INTERVAL_MS)
       return () => clearInterval(timer)
     }, 'vmsb: metrics')
+// 状态兜底落盘:周期 flush + 卸载时落盘(配合去抖,保证不丢最后 300ms)
+    ctx.effect(() => {
+      const timer = setInterval(() => { flushStateNow() }, 60 * 1000)
+      if (timer && typeof timer.unref === 'function') timer.unref()
+      return () => { clearInterval(timer); try { flushStateNow() } catch (e) { /* ignore */ } }
+    }, 'vmsb: state flush')
 // ---------- HTTP 路由 ----------
   if (webServer) {
     const route = (path, handler) => {
@@ -1605,6 +1800,21 @@ function apply(ctx) {
         }
       }, 'vmsb: ' + path)
     }
+
+    // 面板 CSRF token 下发(只读 GET;跨源页面无法读取响应体 -> token 只对本会话可见)
+    route('/vmsb-api/token', async (req, res) => {
+      try {
+        const q = queryOf(req)
+        const sid = q.get('session') || ''
+        const now = Date.now()
+        for (const [k, v] of csrfTokens) { if (v.exp < now) csrfTokens.delete(k) }
+        const token = genId('csrf')
+        if (sid) csrfTokens.set(sid, { token, exp: now + CSRF_TTL_MS })
+        sendJson(res, 200, { ok: true, session: sid, token: sid ? token : '' })
+      } catch (err) {
+        sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+      }
+    })
 
     route('/vmsb-api/list', async (req, res) => {
       try {
@@ -1639,7 +1849,9 @@ function apply(ctx) {
 
     route('/vmsb-api/create', async (req, res) => {
       try {
-        const q = queryOf(req)
+        const body = await gate(req, res, { method: 'POST', token: true })
+        if (body === null) return
+        const q = pFrom(req, body)
         const sessionId = q.get('session') || ''
         if (!sessionId) throw new Error('缺少会话标识')
         const distro = q.get('distro') === 'alpine' ? 'alpine' : 'debian'
@@ -1675,7 +1887,9 @@ function apply(ctx) {
 
     route('/vmsb-api/start', async (req, res) => {
       try {
-        const q = queryOf(req)
+        const body = await gate(req, res, { method: 'POST', token: true })
+        if (body === null) return
+        const q = pFrom(req, body)
         const name = q.get('name') || ''
         const sessionId = q.get('session') || ''
         if (!name) throw new Error('缺少机器名称')
@@ -1694,7 +1908,9 @@ function apply(ctx) {
 
     route('/vmsb-api/restart', async (req, res) => {
       try {
-        const q = queryOf(req)
+        const body = await gate(req, res, { method: 'POST', token: true })
+        if (body === null) return
+        const q = pFrom(req, body)
         const name = q.get('name') || ''
         const sessionId = q.get('session') || ''
         if (!name) throw new Error('缺少机器名称')
@@ -1710,7 +1926,9 @@ function apply(ctx) {
 
     route('/vmsb-api/sleep', async (req, res) => {
       try {
-        const q = queryOf(req)
+        const body = await gate(req, res, { method: 'POST', token: true })
+        if (body === null) return
+        const q = pFrom(req, body)
         const name = q.get('name') || ''
         const sessionId = q.get('session') || ''
         if (!name) throw new Error('缺少机器名称')
@@ -1726,7 +1944,9 @@ function apply(ctx) {
 
     route('/vmsb-api/delete', async (req, res) => {
       try {
-        const q = queryOf(req)
+        const body = await gate(req, res, { method: 'POST', token: true })
+        if (body === null) return
+        const q = pFrom(req, body)
         const name = q.get('name') || ''
         const sessionId = q.get('session') || ''
         if (!name) throw new Error('缺少机器名称')
@@ -1788,7 +2008,9 @@ route('/vmsb-api/snapshots', async (req, res) => {
       })
       route('/vmsb-api/snapshot', async (req, res) => {
         try {
-          const q = queryOf(req)
+          const body = await gate(req, res, { method: 'POST', token: true })
+          if (body === null) return
+          const q = pFrom(req, body)
           const sessionId = q.get('session') || ''
           const action = q.get('action') || ''
           const machine = q.get('machine') || ''
@@ -1854,12 +2076,16 @@ route('/vmsb-api/snapshots', async (req, res) => {
       })
 route('/vmsb-api/network', async (req, res) => {
         try {
-          const q = queryOf(req)
+          const isPost = !!(req.method && String(req.method).toUpperCase() === 'POST')
+          const body = isPost ? await gate(req, res, { method: 'POST', token: true }) : await gate(req, res, { method: 'GET' })
+          if (body === null) return
+          const q = pFrom(req, isPost ? body : {})
           const sessionId = q.get('session') || ''
           const machine = q.get('machine') || ''
           const hasSet = q.get('public_access') !== null || q.get('internal_access') !== null || q.get('isolated') !== null || q.get('isolate_network') !== null || q.get('allowlist') !== null
           if (!machine) throw new Error('缺少机器名称')
           if (hasSet) {
+            if (!isPost) { sendJson(res, 405, { ok: false, error: '网络策略修改需要 POST' }); return }
             const parseB = (v) => v === null ? undefined : (v === '1' || v === 'true')
             const allow = q.get('allowlist') ? q.get('allowlist').split(',').map((x) => x.trim()).filter(Boolean) : undefined
             sendJson(res, 200, await setNetworkPolicy(ctx, sessionId, machine, parseB(q.get('public_access')), parseB(q.get('internal_access')), parseB(q.get('isolated')), parseB(q.get('isolate_network')), allow))
@@ -1872,7 +2098,10 @@ route('/vmsb-api/network', async (req, res) => {
       })
       route('/vmsb-api/share', async (req, res) => {
         try {
-          const q = queryOf(req)
+          const isPost = !!(req.method && String(req.method).toUpperCase() === 'POST')
+          const body = isPost ? await gate(req, res, { method: 'POST', token: true }) : await gate(req, res, { method: 'GET' })
+          if (body === null) return
+          const q = pFrom(req, isPost ? body : {})
           const sessionId = q.get('session') || ''
           const machine = q.get('machine') || ''
           const target = q.get('session_target') || ''
@@ -1880,6 +2109,7 @@ route('/vmsb-api/network', async (req, res) => {
           const action = q.get('action') || 'list'
           if (!machine) throw new Error('缺少机器名称')
           if (action === 'add') {
+            if (!isPost) { sendJson(res, 405, { ok: false, error: '共享添加需要 POST' }); return }
             if (!sessionId || !target) throw new Error('缺少 session/session_target')
             if (!canOwner(sessionId, machine)) throw new Error('只有归属会话可以共享')
             const grants = state.shares[machine] = state.shares[machine] || []
@@ -1888,6 +2118,7 @@ route('/vmsb-api/network', async (req, res) => {
             else grants.push({ sessionId: target, mode, sharedAt: Date.now() })
             saveState()
           } else if (action === 'remove') {
+            if (!isPost) { sendJson(res, 405, { ok: false, error: '共享移除需要 POST' }); return }
             if (!target) throw new Error('缺少 session_target')
             const grants = state.shares[machine] = (state.shares[machine] || []).filter((g) => g.sessionId !== target)
             if (grants.length === 0) delete state.shares[machine]
@@ -1900,13 +2131,18 @@ route('/vmsb-api/network', async (req, res) => {
       })
       route('/vmsb-api/job', async (req, res) => {
         try {
-          const q = queryOf(req)
+          const isPost = !!(req.method && String(req.method).toUpperCase() === 'POST')
+          const body = isPost ? await gate(req, res, { method: 'POST', token: true }) : await gate(req, res, { method: 'GET' })
+          if (body === null) return
+          const q = pFrom(req, isPost ? body : {})
           const sessionId = q.get('session') || ''
           const id = q.get('id') || ''
           const action = q.get('action') || 'list'
           if (id && action === 'stop') {
+            if (!isPost) { sendJson(res, 405, { ok: false, error: '停止任务需要 POST' }); return }
             sendJson(res, 200, await stopJob(ctx, sessionId, id))
           } else if (id && action === 'rotate') {
+            if (!isPost) { sendJson(res, 405, { ok: false, error: '日志轮转需要 POST' }); return }
             const job = jobById(id)
             if (!job) throw new Error('未找到后台任务')
             sendJson(res, 200, await jobLogRotate(id))
@@ -1982,7 +2218,7 @@ route('/vmsb-api/network', async (req, res) => {
           templateName: template || null,
         }
         if (template) {
-          const tpl = await resolveTemplate(template)
+          const tpl = await resolveTemplate(ctx, template)
           if (tpl && tpl.distro && !(args && args.distro)) options.distro = tpl.distro
           if (tpl && tpl.init_script && !options.initScript && !options.cloudInit) options.initScript = tpl.init_script
           if (tpl && tpl.cloud_init && !options.cloudInit && !options.initScript) options.cloudInit = tpl.cloud_init
@@ -2840,7 +3076,7 @@ registerTool({
           if (state.templates && state.templates[name]) return { ok: true, template: { name, ...state.templates[name], custom: true } }
           const builtin = builtinTemplates()[name]
           if (builtin) return { ok: true, template: { name, ...builtin, builtin: true } }
-          const tpl = await resolveTemplate(args.source || name)
+          const tpl = await resolveTemplate(ctx, args.source || name)
           return { ok: true, template: { name, ...tpl } }
         }
         if (op === 'save') {
@@ -3029,11 +3265,24 @@ registerTool({
     })
   }
 
-  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.2.1, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
+  try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.3.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
 }
 
 export { apply }
 export const inject = ['webServer', 'tools']
+// 测试接缝:导出纯函数供 node:test 单元测试使用(不影响 Cordis 加载)
+export const __vmsb = {
+  cronPartMatch, cronMatch, nextCronRun,
+  sanitizeName, abbreviate, codepointLetter,
+  sizeToBytes, sizeToMiB,
+  parseSimpleYaml,
+  validateAllowlist,
+  sameOriginOk, checkCsrf, csrfTokens,
+  atomicWriteJson, readJsonRobust, flushStateNow,
+  normalizeMachines,
+  canOwner, canExec, canManage, shareMode,
+  ALLOWLIST_RE, STATE_DIR, AUDIT_FILE, METRICS_FILE,
+}
 // ---- 模板库 ----
 function builtinTemplates() {
   return {
@@ -3071,34 +3320,45 @@ function templateList() {
   return builtin.concat(custom)
 }
 
-async function resolveTemplate(template) {
+async function resolveTemplate(ctx, template) {
   const name = String(template || '').trim()
   if (!name) return null
   if (state.templates && state.templates[name]) return state.templates[name]
   const builtin = builtinTemplates()[name]
   if (builtin) return builtin
-  // 支持本地 JSON/YAML 文件路径
+  // 支持本地 JSON/YAML 文件路径(仅限工作区内,防止读取宿主任意文件)
   if (name.startsWith('/') || name.startsWith('.')) {
-    const full = existsSync(name) ? name : join(process.cwd(), name)
+    const full = resolveWorkspacePath(ctx, name)
     if (!existsSync(full)) throw new Error('模板文件不存在: ' + full)
     const text = readFileSync(full, 'utf8')
     if (full.endsWith('.json')) return JSON.parse(text)
     return parseSimpleYaml(text)
   }
-  // 支持 GitHub raw URL
-  if (/^https?:\/\//.test(name)) {
+  // 支持 GitHub raw URL(仅 https)
+  if (/^https:\/\//i.test(name)) {
     const res = await fetch(name, { timeout: 20000 })
     if (!res.ok) throw new Error('模板下载失败: HTTP ' + res.status)
     const text = await res.text()
+    if (text.length > 1024 * 1024) throw new Error('模板文件过大(>1MB)')
     if (name.endsWith('.json')) return JSON.parse(text)
     return parseSimpleYaml(text)
   }
   throw new Error('未找到模板: ' + name + '（可用 vm_template 查看）')
 }
-// ---- 指标历史 ----
+
+// 将模板/导入导出路径解析限制在工作区根目录内
+function resolveWorkspacePath(ctx, p) {
+  const root = workspaceRootOf(ctx)
+  const full = resolve(root, String(p || '').replace(/^~/, HOME))
+  if (full !== root && !full.startsWith(root + sep)) {
+    throw new Error('路径必须位于工作区内: ' + root)
+  }
+  return full
+}
+// ---- 指标历史(独立 metrics.json 存储,不随主 state 序列化) ----
 function pushMetrics(name, point) {
-  if (!state.metrics[name]) state.metrics[name] = []
-  const list = state.metrics[name]
+  let list = metricsStore.get(name)
+  if (!list) { list = []; metricsStore.set(name, list) }
   list.push(point)
   if (list.length > MAX_METRICS_POINTS) list.splice(0, list.length - MAX_METRICS_POINTS)
 }
@@ -3117,7 +3377,7 @@ async function sampleAllMetrics() {
 }
 
 function metricsView(name, limit) {
-  const list = state.metrics[name] || []
+  const list = metricsStore.get(name) || []
   const n = Math.max(1, Number(limit) || 120)
   return { ok: true, machine: name, metrics: list.slice(-n).map((p) => ({ ...p })) }
 }

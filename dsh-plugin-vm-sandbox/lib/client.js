@@ -83,6 +83,31 @@ window.__ModuleLoader__.load({
 					return j;
 				});
 		}
+		// 变更类面板请求:S1 加固后副作用接口改走 POST,并回传按 session 绑定的 CSRF token
+		// (token 由 GET /vmsb-api/token 下发;跨源页面读不到响应体,故可防 CSRF)
+		const __vmsbTokens = {};
+		function __vmsbToken(session) {
+			if (__vmsbTokens[session]) return Promise.resolve(__vmsbTokens[session]);
+			return api("token", { session: session || "" }).then(
+				(r) => { const t = (r && r.token) || ""; __vmsbTokens[session] = t; return t; },
+				() => { __vmsbTokens[session] = ""; return ""; },
+			);
+		}
+		function apiPost(path, body) {
+			const session = (body && body.session) || "";
+			const send = (tok) => fetch("/vmsb-api/" + path, {
+				method: "POST",
+				cache: "no-store",
+				headers: Object.assign({ "Content-Type": "application/json" }, tok ? { "X-VMSB-Token": tok } : {}),
+				body: JSON.stringify(body || {}),
+			})
+				.then((r) => r.json().catch(() => ({ ok: false, error: "HTTP " + r.status })))
+				.then((j) => {
+					if (!j || j.ok === false) throw new Error((j && j.error) || "请求失败");
+					return j;
+				});
+			return __vmsbToken(session).then(send);
+		}
 		function download(name, text) {
 			const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
 			const url = URL.createObjectURL(blob);
@@ -302,7 +327,7 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 
 			const act = React.useCallback((action, name) => {
 				setBusy((b) => Object.assign({}, b, { [name]: action }));
-				api(action, { name, session: sessionId }).then(
+				apiPost(action, { name, session: sessionId }).then(
 					() => {
 						setBusy((b) => { const n = Object.assign({}, b); delete n[name]; return n; });
 						setConfirmDel(null);
@@ -317,7 +342,7 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 
 			const onCreate = React.useCallback((distro) => {
 				setCreating(distro);
-				api("create", { session: sessionId, distro }).then(
+				apiPost("create", { session: sessionId, distro }).then(
 					(res) => {
 						setCreating(null);
 						if (res && res.machine) {
@@ -485,7 +510,7 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 				if (tab === "snap") {
 					if (!snaps) return React.createElement("div", { className: "vmsb-muted" }, "加载中…");
 					const defaultMachine = data && data.own && data.own[0] ? data.own[0].name : "";
-					const createSnap = () => { if (!defaultMachine) return; api("snapshot", { action: "create", machine: defaultMachine, session: sessionId }).then(() => loadTab("snap"), (e) => setError(String((e && e.message) || e))); };
+					const createSnap = () => { if (!defaultMachine) return; apiPost("snapshot", { action: "create", machine: defaultMachine, session: sessionId }).then(() => loadTab("snap"), (e) => setError(String((e && e.message) || e))); };
 					return React.createElement("div", null,
 						React.createElement("div", { style: { marginBottom: 8 } },
 							panelButton(createSnap, defaultMachine ? "为 " + defaultMachine + " 新建快照" : "无本会话虚拟机可快照"),
@@ -496,8 +521,8 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 								React.createElement("span", { className: "vmsb-name" }, s.name),
 								React.createElement("span", { className: "vmsb-meta" }, "来自 " + (s.source || "?")),
 								React.createElement("span", { className: "vmsb-owner" }, formatTime(s.createdAt)),
-								panelButton(() => { api("snapshot", { action: "restore", snapshot: s.name, session: sessionId }).then(refreshList, (e) => setError(String((e && e.message) || e))); }, "恢复"),
-								panelButton(() => { api("snapshot", { action: "delete", snapshot: s.name, session: sessionId }).then(() => { loadTab("snap"); }, (e) => setError(String((e && e.message) || e))); }, "删除", true),
+								panelButton(() => { apiPost("snapshot", { action: "restore", snapshot: s.name, session: sessionId }).then(refreshList, (e) => setError(String((e && e.message) || e))); }, "恢复"),
+								panelButton(() => { apiPost("snapshot", { action: "delete", snapshot: s.name, session: sessionId }).then(() => { loadTab("snap"); }, (e) => setError(String((e && e.message) || e))); }, "删除", true),
 							),
 						))),
 						snaps.length === 0 ? React.createElement("div", { className: "vmsb-muted" }, "暂无快照。") : null,
@@ -515,7 +540,7 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 								React.createElement("span", { className: "vmsb-meta" }, (j.machine || "") + " · " + (j.status || "")),
 								React.createElement("span", { className: "vmsb-owner" }, (j.command || "").slice(0, 60)),
 								j.status === "running"
-									? panelButton(() => { api("job", { action: "stop", id: j.id, session: sessionId }).then(reloadJobs, (e) => setError(String((e && e.message) || e))); }, "停止", true)
+									? panelButton(() => { apiPost("job", { action: "stop", id: j.id, session: sessionId }).then(reloadJobs, (e) => setError(String((e && e.message) || e))); }, "停止", true)
 									: null,
 								panelButton(() => { api("job", { action: "output", id: j.id, session: sessionId }).then((r) => setError(String(JSON.stringify(r.log || "")).slice(0, 500)), (e) => setError(String((e && e.message) || e))); }, "日志"),
 							),
@@ -572,13 +597,13 @@ const panelButton = (onClick, label, danger) => React.createElement("button", { 
 						const p = (meta.net || {})[m.name] || {};
 						const sh = (meta.shares || {})[m.name] || [];
 						const owned = data && data.own && data.own.some((o) => o.name === m.name);
-						const toggle = (key) => api("network", { session: sessionId, machine: m.name, [key]: p[key] === false ? 1 : 0 }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
-						const removeShare = (sid) => api("share", { action: "remove", machine: m.name, session_target: sid, session: sessionId }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+						const toggle = (key) => apiPost("network", { session: sessionId, machine: m.name, [key]: p[key] === false ? 1 : 0 }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+						const removeShare = (sid) => apiPost("share", { action: "remove", machine: m.name, session_target: sid, session: sessionId }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
 						const addShare = () => {
 							const sid = window.prompt("目标会话 ID");
 							if (!sid) return;
 							const mode = window.prompt("权限模式(exec/manage)", "exec");
-							api("share", { action: "add", machine: m.name, session_target: sid, mode: mode || "exec", session: sessionId }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
+							apiPost("share", { action: "add", machine: m.name, session_target: sid, mode: mode || "exec", session: sessionId }).then(reloadMeta, (e) => setError(String((e && e.message) || e)));
 						};
 						return React.createElement("div", { key: "net-" + m.name, className: "vmsb-item" },
 							React.createElement("div", { className: "vmsb-row" },
