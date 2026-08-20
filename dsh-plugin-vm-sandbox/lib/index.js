@@ -95,7 +95,7 @@ function loadStateFile() {
       recovered = true
     } catch (e2) { parsed = null }
   }
-  const empty = { version: 4, machines: {}, snapshots: {}, shares: {}, policies: {}, network: {}, jobs: [], tunnels: [], cron: [], templates: {}, services: {} }
+  const empty = { version: 4, machines: {}, snapshots: {}, shares: {}, policies: {}, network: {}, jobs: [], tunnels: [], cron: [], templates: {}, services: {}, alerts: [] }
   if (!parsed || typeof parsed !== 'object' || !parsed.machines || typeof parsed.machines !== 'object') {
     return { core: empty, legacy: { audit: [], metrics: {} } }
   }
@@ -115,6 +115,7 @@ function loadStateFile() {
       cron: Array.isArray(parsed.cron) ? parsed.cron : [],
       templates: parsed.templates && typeof parsed.templates === 'object' ? parsed.templates : {},
       services: parsed.services && typeof parsed.services === 'object' ? parsed.services : {},
+      alerts: Array.isArray(parsed.alerts) ? parsed.alerts : [],
     },
     legacy: {
       audit: Array.isArray(parsed.audit) ? parsed.audit : [],
@@ -1681,11 +1682,40 @@ async function machineConfigOf(name) {
   return out
 }
 
-async function probeStatus(name) {
-  const cmd = "echo uptime=$(uptime -p 2>/dev/null || true); echo load=$(cat /proc/loadavg 2>/dev/null || true); echo mem=$(free -b 2>/dev/null | awk 'NR==2{print $2, $3, $7}'); echo disk=$(df -B1 / 2>/dev/null | awk 'NR==2{print $2, $3, $4}')"
-  const res = await orb(['run', '-m', name, '-u', 'root', 'sh', '-lc', cmd], { timeoutMs: 15000 })
+const PROBE_CMD = [
+  '#!/bin/sh',
+  'echo "uptime=$(uptime -p 2>/dev/null || uptime 2>/dev/null || true)"',
+  'echo "load=$(cat /proc/loadavg 2>/dev/null || true)"',
+  "mem=$(free -b 2>/dev/null | awk 'NR==2{print $2, $3, $7}')",
+  'echo "mem=$mem"',
+  'disk=$(df -B1 / 2>/dev/null | awk \'NR==2{print $2, $3, $4}\')',
+  'echo "disk=$disk"',
+  'cpu_busy=$(awk \'NR==1{print $2+$3+$4+$6+$7+$8, $5, $2+$3+$4+$5+$6+$7+$8}\' /proc/stat 2>/dev/null)',
+  'cpu_cores=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)',
+  'echo "cpu=$cpu_busy $cpu_cores"',
+  'echo "cpu=$cpu"',
+  "net=$(awk '$1 ~ /^(eth|ens|enp|en|wl|wlan)/ {rx += $2; tx += $10} END {print rx+0, tx+0}' /proc/net/dev 2>/dev/null)",
+  'echo "net=$net"',
+  "io=$(awk '$3 ~ /^(sda|sdb|sdc|sdd|nvme[0-9]n[0-9]|vd[a-z])/ {r += $6; w += $10} END {print r+0, w+0}' /proc/diskstats 2>/dev/null)",
+  'echo "io=$io"',
+  'echo "tops="',
+  "(ps -eo pcpu=,pmem=,comm= --sort=-pcpu 2>/dev/null || ps -o pcpu=,pmem=,args= 2>/dev/null || ps aux 2>/dev/null) | head -6",
+].join('\n')
+
+function parseProbeOutput(stdout) {
   const out = {}
-  for (const line of String(res.stdout || '').split('\n')) {
+  let inTops = false
+  const tops = []
+  for (const raw of String(stdout || '').split('\n')) {
+    const line = raw
+    if (line.startsWith('tops=')) { inTops = true; continue }
+    if (inTops) {
+      if (line.includes('=')) { inTops = false } else {
+        const m = line.trim().split(/\s+/)
+        if (m.length >= 3 && /^[0-9.]/.test(m[0]) && /^[0-9.]/.test(m[1])) tops.push({ cpu: Number(m[0]), mem: Number(m[1]), cmd: m.slice(2).join(' ') })
+        continue
+      }
+    }
     const idx = line.indexOf('=')
     if (idx <= 0) continue
     const k = line.slice(0, idx).trim()
@@ -1693,14 +1723,20 @@ async function probeStatus(name) {
     if (!v) continue
     if (k === 'uptime') out.uptime = v
     else if (k === 'load') out.load = v
-    else if (k === 'mem') {
-      const parts = v.split(/\s+/).map(Number)
-      out.memory = { totalBytes: parts[0] || null, usedBytes: parts[1] || null, availableBytes: parts[2] || null }
-    } else if (k === 'disk') {
-      const parts = v.split(/\s+/).map(Number)
-      out.rootFs = { totalBytes: parts[0] || null, usedBytes: parts[1] || null, availableBytes: parts[2] || null }
-    }
+    else if (k === 'mem') { const p = v.split(/\s+/).map(Number); out.memory = { totalBytes: p[0] || null, usedBytes: p[1] || null, availableBytes: p[2] || null } }
+    else if (k === 'disk') { const p = v.split(/\s+/).map(Number); out.rootFs = { totalBytes: p[0] || null, usedBytes: p[1] || null, availableBytes: p[2] || null } }
+    else if (k === 'cpu') { const p = v.split(/\s+/).map(Number); out.cpu = { busy: p[0] || 0, idle: p[1] || 0, total: p[2] || 0, cores: p[3] || null } }
+    else if (k === 'net') { const p = v.split(/\s+/).map(Number); out.net = { rx: p[0] || 0, tx: p[1] || 0 } }
+    else if (k === 'io') { const p = v.split(/\s+/).map(Number); out.io = { r: p[0] || 0, w: p[1] || 0 } }
   }
+  if (tops.length) out.tops = tops
+  return out
+}
+
+async function probeStatus(name) {
+  const b64 = Buffer.from(PROBE_CMD, 'utf8').toString('base64')
+  const res = await orb(['run', '-m', name, '-u', 'root', 'sh', '-lc', "printf '%s' '" + b64 + "' | base64 -d | sh"], { timeoutMs: 15000 })
+  const out = parseProbeOutput(res.stdout || '')
   if (res.exitCode !== 0) out.probeError = String(res.stderr || '')
   return out
 }
@@ -2206,6 +2242,16 @@ route('/vmsb-api/snapshots', async (req, res) => {
           const machine = q.get('machine') || ''
           if (!machine) throw new Error('缺少机器名称')
           sendJson(res, 200, metricsView(machine, q.get('limit') || 120))
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
+        }
+      })
+      route('/vmsb-api/alerts', async (req, res) => {
+        try {
+          const q = queryOf(req)
+          const sessionId = q.get('session') || ''
+          const rules = (state.alerts || []).filter((r) => !sessionId || r.sessionId === sessionId).map((r) => ({ ...r }))
+          sendJson(res, 200, { ok: true, sessionId, rules, recentFires: recentFires.map((f) => ({ ...f })) })
         } catch (err) {
           sendJson(res, 500, { ok: false, error: String((err && err.message) || err).slice(0, 300) })
         }
@@ -3528,6 +3574,65 @@ registerTool({
         }
       },
     })
+
+    registerTool({
+      name: 'vm_alert',
+      description: '指标阈值告警(C1):operation=add/list/remove。rule 在每次指标采样(30s)时评估,命中即记 vm_alert_fire 审计并出现在 /vmsb-api/alerts;metric ∈ cpu|mem|disk|load|netRx|netTx|io,op ∈ gt|gte|lt|lte|eq,value 为阈值,cooldown_min 为冷却(0=每次命中都触发),machine 留空则作用于该会话全部机器。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['add', 'list', 'remove'], description: '操作类型,默认 list。' },
+          name: { type: 'string', description: '规则名(唯一,add/remove 时使用)。' },
+          metric: { type: 'string', enum: ['cpu', 'mem', 'disk', 'load', 'netRx', 'netTx', 'io'], description: '度量:CPU%/内存%/磁盘%/load(1min)/网络入(MB/s→Bps)/netTx/io(sectors/s)。' },
+          op: { type: 'string', enum: ['gt', 'gte', 'lt', 'lte', 'eq'], description: '比较操作。' },
+          value: { type: 'number', description: '阈值。' },
+          message: { type: 'string', description: '可选告警文案。' },
+          cooldown_min: { type: 'number', description: '冷却分钟(默认 0)。' },
+          machine: { type: 'string', description: '目标机器;留空作用于本会话全部机器。' },
+          enabled: { type: 'boolean', description: 'add 时是否启用,默认 true。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const op = (args && args.operation) || 'list'
+        try {
+          if (op === 'add') {
+            const name = String((args && args.name) || '').trim()
+            const metric = String((args && args.metric) || '').trim()
+            const o = String((args && args.op) || '').trim()
+            const value = Number(args && args.value)
+            if (!/^[a-zA-Z0-9_.-]{1,64}$/.test(name)) throw new Error('name 仅允许字母数字._-(<=64)')
+            if (!['cpu', 'mem', 'disk', 'load', 'netRx', 'netTx', 'io'].includes(metric)) throw new Error('metric 不合法')
+            if (!['gt', 'gte', 'lt', 'lte', 'eq'].includes(o)) throw new Error('op 不合法')
+            if (!Number.isFinite(value)) throw new Error('value 必须为数字')
+            const existing = (state.alerts || []).find((r) => r.sessionId === sessionId && r.name === name)
+            const rule = existing || { id: genId('alrt'), sessionId, createdAt: Date.now(), count: 0 }
+            Object.assign(rule, { name, metric, op: o, value, message: String((args && args.message) || '').slice(0, 200), cooldownMin: Math.max(0, Number(args && args.cooldown_min) || 0), machine: sanitizeName(args && args.machine) || null, enabled: args && args.enabled === false ? false : true })
+            if (!existing) state.alerts = state.alerts || []
+            if (!existing && !state.alerts.some((r) => r.id === rule.id)) state.alerts.push(rule)
+            saveState()
+            pushAudit(sessionId, rule.machine, 'vm_alert_add', { name, metric, op: o, value }, true, null)
+            return { ok: true, rule }
+          }
+          if (op === 'remove') {
+            const name = String((args && args.name) || '').trim()
+            const idx = (state.alerts || []).findIndex((r) => r.sessionId === sessionId && r.name === name)
+            if (idx < 0) throw new Error('未找到规则: ' + name)
+            const [rule] = state.alerts.splice(idx, 1)
+            saveState()
+            pushAudit(sessionId, rule.machine, 'vm_alert_remove', { name }, true, null)
+            return { ok: true, removed: rule }
+          }
+          const rules = (state.alerts || []).filter((r) => r.sessionId === sessionId).map((r) => ({ ...r }))
+          return { ok: true, rules }
+        } catch (err) {
+          pushAudit(sessionId, null, 'vm_alert_' + op, { name: args && args.name }, false, String((err && err.message) || err))
+          throw err
+        }
+      },
+    })
   }
 
   try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.3.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
@@ -3552,6 +3657,8 @@ export const __vmsb = {
   VAULT_FILE, VAULT_KEY_FILE,
   vaultEncrypt, vaultDecrypt, vaultSet, vaultGet, vaultList, vaultRemove,
   injectVaultText, redactVaultText, redactDeep,
+  // C1 增强指标/告警测试接缝
+  parseProbeOutput, metricValueOf, evalAlert, sampleAllMetrics, evaluateAlerts, metricsView, PROBE_CMD,
 }
 // ---- 模板库 ----
 function builtinTemplates() {
@@ -3626,6 +3733,11 @@ function resolveWorkspacePath(ctx, p) {
   return full
 }
 // ---- 指标历史(独立 metrics.json 存储,不随主 state 序列化) ----
+const cpuPrev = new Map()
+const netPrev = new Map()
+const ioPrev = new Map()
+let recentFires = []
+
 function pushMetrics(name, point) {
   let list = metricsStore.get(name)
   if (!list) { list = []; metricsStore.set(name, list) }
@@ -3633,14 +3745,77 @@ function pushMetrics(name, point) {
   if (list.length > MAX_METRICS_POINTS) list.splice(0, list.length - MAX_METRICS_POINTS)
 }
 
+// C1: 从指标点取某个可告警度量值
+function metricValueOf(point, metric) {
+  if (!point) return null
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+  if (metric === 'cpu') return num(point.cpuPercent)
+  if (metric === 'mem') return point.memory && point.memory.totalBytes ? Math.round((1 - (point.memory.availableBytes || 0) / point.memory.totalBytes) * 1000) / 10 : null
+  if (metric === 'disk') return point.rootFs && point.rootFs.totalBytes ? Math.round((1 - (point.rootFs.availableBytes || 0) / point.rootFs.totalBytes) * 1000) / 10 : null
+  if (metric === 'load') { const p = Number(String(point.load || '').split(' ')[0]); return Number.isFinite(p) ? p : null }
+  if (metric === 'netRx') return num(point.netRxBps)
+  if (metric === 'netTx') return num(point.netTxBps)
+  if (metric === 'io') return num(point.ioOps)
+  return null
+}
+function evalAlert(rule, point) {
+  const v = metricValueOf(point, rule && rule.metric)
+  if (v === null || v === undefined || Number.isNaN(v)) return false
+  const t = Number(rule.value)
+  const ops = { gt: v > t, gte: v >= t, lt: v < t, lte: v <= t, eq: v === t }
+  return !!ops[rule.op]
+}
+function evaluateAlerts(machine, point) {
+  const now = Date.now()
+  for (const rule of state.alerts || []) {
+    if (!rule.enabled) continue
+    if (rule.machine && rule.machine !== machine) continue
+    if (!evalAlert(rule, point)) continue
+    const cooldown = (rule.cooldownMin || 0) * 60000
+    if (rule.lastFiredAt && cooldown > 0 && now - rule.lastFiredAt < cooldown) continue
+    rule.lastFiredAt = now
+    rule.count = (rule.count || 0) + 1
+    recentFires.unshift({ ts: now, machine, name: rule.name, metric: rule.metric, value: metricValueOf(point, rule.metric), message: rule.message || '', sessionId: rule.sessionId })
+    if (recentFires.length > 20) recentFires.length = 20
+    saveState()
+    pushAudit(rule.sessionId, machine, 'vm_alert_fire', { name: rule.name, metric: rule.metric, value: metricValueOf(point, rule.metric) }, true, null)
+  }
+}
+
 async function sampleAllMetrics() {
   try {
     const machines = await listMachines()
     const running = machines.filter((m) => m.state === 'running' && !state.snapshots[m.name])
+    const now = Date.now()
     for (const m of running) {
       const probe = await probeStatus(m.name).catch(() => null)
       if (!probe) continue
-      pushMetrics(m.name, { ts: Date.now(), ...probe })
+      const point = { ts: now, ...probe }
+      // CPU 使用率(两次采样差)
+      const cp = cpuPrev.get(m.name)
+      if (cp && probe.cpu && probe.cpu.total > cp.total && now > cp.ts) {
+        const busyDelta = (probe.cpu.total - probe.cpu.idle) - (cp.total - cp.idle)
+        const totalDelta = probe.cpu.total - cp.total
+        if (totalDelta > 0) point.cpuPercent = Math.max(0, Math.min(100, Math.round((busyDelta / totalDelta) * 1000) / 10))
+        point.cpuCores = probe.cpu.cores
+      }
+      cpuPrev.set(m.name, { ts: now, total: probe.cpu ? probe.cpu.total : 0, idle: probe.cpu ? probe.cpu.idle : 0 })
+      // 网络速率 / IO 速率
+      const np = netPrev.get(m.name)
+      if (np && probe.net) {
+        const dt = Math.max(1, (now - np.ts) / 1000)
+        if (probe.net.rx >= np.rx) point.netRxBps = Math.round((probe.net.rx - np.rx) / dt)
+        if (probe.net.tx >= np.tx) point.netTxBps = Math.round((probe.net.tx - np.tx) / dt)
+      }
+      netPrev.set(m.name, { ts: now, rx: probe.net ? probe.net.rx : 0, tx: probe.net ? probe.net.tx : 0 })
+      const ip = ioPrev.get(m.name)
+      if (ip && probe.io) {
+        const dt = Math.max(1, (now - ip.ts) / 1000)
+        if (probe.io.r + probe.io.w >= ip.r + ip.w) point.ioOps = Math.round(((probe.io.r - ip.r) + (probe.io.w - ip.w)) / dt)
+      }
+      ioPrev.set(m.name, { ts: now, r: probe.io ? probe.io.r : 0, w: probe.io ? probe.io.w : 0 })
+      pushMetrics(m.name, point)
+      evaluateAlerts(m.name, point)
     }
     saveState()
   } catch (e) { /* 采样失败静默 */ }

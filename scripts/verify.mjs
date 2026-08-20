@@ -47,7 +47,7 @@ const requiredTools = [
   'vm_audit', 'vm_share', 'vm_unshare', 'vm_policy', 'vm_network',
   'vm_cron', 'vm_template', 'vm_resize', 'vm_metrics', 'vm_export', 'vm_import',
   'vm_service_discover', 'vm_service_register',
-  'vm_harden', 'vm_secret',
+  'vm_harden', 'vm_secret', 'vm_alert',
 ]
 
 const missing = requiredTools.filter((name) => !toolsMap[name])
@@ -84,6 +84,7 @@ const requiredParams = {
   vm_network: ['public_access', 'internal_access', 'isolated', 'isolate_network', 'allowlist'],
   vm_harden: ['operation', 'machine'],
   vm_secret: ['operation', 'name', 'value'],
+  vm_alert: ['operation', 'name', 'metric', 'op', 'value'],
 }
 
 const failures = []
