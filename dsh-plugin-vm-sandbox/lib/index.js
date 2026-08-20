@@ -391,9 +391,64 @@ function touchMachine(sessionId, name) {
 // ---------- 权限模型 ----------
 function sessionPolicy(sessionId) {
   return Object.assign(
-    { maxMachines: MAX_PER_SESSION, idleSleepMinutes: 30, idleDeleteDays: 0, snapshotIntervalHours: 0, snapshotRetention: 0 },
+    { maxMachines: MAX_PER_SESSION, idleSleepMinutes: 30, idleDeleteDays: 0, snapshotIntervalHours: 0, snapshotRetention: 0, cpuQuota: 0, memoryQuotaMiB: 0 },
     (state.policies && state.policies[sessionId]) || {},
   )
+}
+
+// D4: 每会话累计资源用量与配额
+function sessionResourceUsage(sessionId) {
+  let cpus = 0
+  let memoryMiB = 0
+  for (const rec of sessionMachines(sessionId)) {
+    const c = Number(rec.spec && rec.spec.cpus) || 0
+    if (c > 0) cpus += c
+    const m = sizeToMiB(rec.spec && rec.spec.memory) || 0
+    if (m > 0) memoryMiB += m
+  }
+  return { cpus, memoryMiB, machines: sessionMachines(sessionId).length }
+}
+function quotaState(sessionId, reqCpus, reqMemMiB) {
+  const policy = sessionPolicy(sessionId)
+  const usage = sessionResourceUsage(sessionId)
+  const req = { cpus: Number(reqCpus) || 0, memoryMiB: Number(reqMemMiB) || 0 }
+  const countOk = usage.machines + 1 <= policy.maxMachines
+  const cpuOk = policy.cpuQuota > 0 ? usage.cpus + req.cpus <= policy.cpuQuota : true
+  const memOk = policy.memoryQuotaMiB > 0 ? usage.memoryMiB + req.memoryMiB <= policy.memoryQuotaMiB : true
+  const fits = countOk && cpuOk && memOk
+  return { fits, countOk, cpuOk, memOk, usage, policy, req }
+}
+// D4: 处理排队中的创建请求(FIFO;每当有释放空间时推进)
+async function processQueuedCreations(ctx) {
+  for (const sid of Object.keys(state.queue || {})) {
+    const q = state.queue[sid]
+    if (!Array.isArray(q) || q.length === 0) { delete state.queue[sid]; continue }
+    while (q.length) {
+      const item = q[0]
+      if (!item || item.status === 'processing') break
+      const req = item.req || {}
+      const reqCpus = Number(req.cpus) || 2
+      const reqMemMiB = sizeToMiB(req.memory) || 2048
+      const qs = quotaState(sid, reqCpus, reqMemMiB)
+      if (!qs.fits) break
+      item.status = 'processing'
+      saveState()
+      try {
+        const rec = await createMachineForSession(ctx, sid, req.distro || 'debian', null, req.hint || null, { ...req })
+        item.status = 'done'; item.machine = rec.name; item.doneAt = Date.now()
+        saveState()
+        pushAudit(sid, rec.name, 'vm_create_queued_done', { id: item.id }, true, null)
+      } catch (e) {
+        item.status = 'error'; item.error = String((e && e.message) || e); item.doneAt = Date.now()
+        saveState()
+        pushAudit(sid, null, 'vm_create_queued_fail', { id: item.id }, false, String((e && e.message) || e))
+        break
+      }
+    }
+    const remaining = q.filter((i) => i.status !== 'done' && i.status !== 'error')
+    if (remaining.length === 0) delete state.queue[sid]
+    else state.queue[sid] = remaining
+  }
 }
 
 function sharesOf(name) {
@@ -1823,6 +1878,8 @@ async function listView(ctx, sessionId) {
     maxPerSession: MAX_PER_SESSION,
     maxSnapshots: MAX_SNAPSHOTS,
     maxSnapshotsPerSession: MAX_SNAPSHOTS_PER_SESSION,
+    quota: (() => { const q = quotaState(sessionId, 0, 0); return { maxMachines: q.policy.maxMachines, cpuQuota: q.policy.cpuQuota || null, memoryQuotaMiB: q.policy.memoryQuotaMiB || null, machines: q.usage.machines, cpus: q.usage.cpus, memoryMiB: q.usage.memoryMiB } })(),
+    queueCount: (state.queue && state.queue[sessionId] && state.queue[sessionId].length) || 0,
   }
 }
 // ---------- HTTP API(部署插件无 host.call,面板走路由) ----------
@@ -1962,6 +2019,9 @@ function apply(ctx) {
   reconcile(ctx).catch((err) => {
     try { console.error('[vmsb] 初始化对账失败', err) } catch (e) { /* ignore */ }
   })
+  processQueuedCreations(ctx).catch((err) => {
+    try { console.error('[vmsb] 初始创建队列处理失败', err) } catch (e) { /* ignore */ }
+  })
   idleSweep(ctx).catch((err) => {
     try { console.error('[vmsb] 初始闲置检查失败', err) } catch (e) { /* ignore */ }
   })
@@ -1988,9 +2048,9 @@ function apply(ctx) {
       }, METRICS_INTERVAL_MS)
       return () => clearInterval(timer)
     }, 'vmsb: metrics')
-// 状态兜底落盘:周期 flush + 卸载时落盘(配合去抖,保证不丢最后 300ms)
+// 状态兜底落盘:周期 flush + 处理创建队列 + 卸载时落盘(配合去抖,保证不丢最后 300ms)
     ctx.effect(() => {
-      const timer = setInterval(() => { flushStateNow() }, 60 * 1000)
+      const timer = setInterval(() => { flushStateNow(); processQueuedCreations(ctx).catch(() => {}) }, 60 * 1000)
       if (timer && typeof timer.unref === 'function') timer.unref()
       return () => { clearInterval(timer); try { flushStateNow() } catch (e) { /* ignore */ } }
     }, 'vmsb: state flush')
@@ -2415,6 +2475,7 @@ route('/vmsb-api/network', async (req, res) => {
           isolated: { type: 'boolean', description: '可选:创建隔离机器(关闭文件共享/集成),使用 OrbStack 官方 --isolated。' },
           isolate_network: { type: 'boolean', description: '可选:启用网络隔离(自动附带 --isolated),使用 OrbStack 官方 --isolate-network。' },
           harden: { type: 'boolean', description: '可选:创建后应用安全基线(禁 SSH 密码登录/root 仅密钥等),默认 true;false 关闭。' },
+          queue: { type: 'boolean', description: '可选:超过本会话配额(台数/累计 CPU/内存)时才排队等待(返回 queued,完成后 VM 自动出现);默认 false 直接报错。' },
         },
       },
       output: OUT,
@@ -2434,6 +2495,7 @@ route('/vmsb-api/network', async (req, res) => {
           isolated: !!(args && args.isolated),
           isolateNetwork: !!(args && args.isolate_network),
           harden: args && args.harden === false ? false : true,
+          queue: !!(args && args.queue),
           templateName: template || null,
         }
         if (template) {
@@ -2451,8 +2513,25 @@ route('/vmsb-api/network', async (req, res) => {
             const m = await machineStateOf(hint)
             return { machine: hint, distro, state: m ? m.state : 'unknown', existing: true, ownerSession: owner, sessionMachines: sessionMachines(sessionId).map((r) => r.name) }
           }
-          if (sessionMachines(sessionId).length >= sessionPolicy(sessionId).maxMachines) {
-            throw new Error('本会话虚拟机已达上限(' + sessionPolicy(sessionId).maxMachines + ' 台),请先删除不再使用的机器或调整 vm_policy')
+          // D4: 配额检查(台数 + 累计 CPU/内存);支持排队
+          const reqCpus = Number(options.cpus) || 2
+          const reqMemMiB = sizeToMiB(options.memory) || 2048
+          const qs = quotaState(sessionId, reqCpus, reqMemMiB)
+          if (!qs.fits) {
+            if (!options.queue) {
+              const bits = []
+              if (!qs.countOk) bits.push('台数已满(' + qs.policy.maxMachines + ')')
+              if (!qs.cpuOk) bits.push('累计 CPU ' + qs.usage.cpus + '/' + qs.policy.cpuQuota)
+              if (!qs.memOk) bits.push('累计内存 ' + Math.round(qs.usage.memoryMiB / 1024) + '/' + (qs.policy.memoryQuotaMiB / 1024) + ' GB')
+              throw new Error('超出本会话配额: ' + bits.join('; ') + '(可调整 vm_policy 或使用 queue:true 排队)')
+            }
+            state.queue = state.queue || {}
+            state.queue[sessionId] = state.queue[sessionId] || []
+            const qi = { id: genId('q'), sessionId, req: { distro: templateDistro || distro, hint: hint || null, cpus: options.cpus, memory: options.memory, disk: options.disk, initScript: options.initScript, cloudInit: options.cloudInit, isolated: options.isolated, isolateNetwork: options.isolateNetwork, harden: options.harden, templateName: options.templateName }, createdAt: Date.now(), status: 'queued' }
+            state.queue[sessionId].push(qi)
+            saveState()
+            pushAudit(sessionId, null, 'vm_create_queued', { id: qi.id }, true, null)
+            return { ok: true, queued: true, queueId: qi.id, position: state.queue[sessionId].length, machine: null, sessionMachines: sessionMachines(sessionId).map((r) => r.name) }
           }
           const rec = await createMachineForSession(ctx, sessionId, templateDistro || distro, exec.signal, hint, options)
           pushAudit(sessionId, rec.name, 'vm_create', { distro, cpus: options.cpus, memory: options.memory, disk: options.disk, init: !!options.initScript, cloudInit: !!options.cloudInit }, true, null, Date.now() - t0)
@@ -3147,7 +3226,7 @@ registerTool({
 
     registerTool({
       name: 'vm_policy',
-      description: '查看/调整当前会话的虚拟机配额与回收策略:max_machines、idle_sleep_minutes、idle_delete_days。只影响当前会话自己的机器。',
+      description: '查看/调整当前会话的虚拟机配额与回收策略:max_machines、idle_sleep_minutes、idle_delete_days、cpu_quota(累计 CPU 核)、memory_quota(累计内存,如 16G,0=不限制)。只影响当前会话自己的机器。',
       parameters: {
         type: 'object',
         properties: {
@@ -3156,6 +3235,8 @@ registerTool({
           idle_delete_days: { type: 'integer', description: '可选设置闲置自动删除天数(0 表示不自动删除)。' },
           snapshot_interval_hours: { type: 'integer', description: '可选:自动快照间隔(小时),0 表示关闭。' },
           snapshot_retention: { type: 'integer', description: '可选:每台机器保留最新快照份数(0 表示不限制)。' },
+          cpu_quota: { type: 'number', description: '可选:本会话累计 CPU 核数上限(0 表示不限制)。' },
+          memory_quota: { type: 'string', description: '可选:本会话累计内存上限,如 16G / 4096MiB(0 表示不限制)。' },
         },
       },
       output: OUT,
@@ -3169,10 +3250,15 @@ registerTool({
         if (args && args.idle_delete_days !== undefined) next.idleDeleteDays = Math.max(0, Number(args.idle_delete_days))
         if (args && args.snapshot_interval_hours !== undefined) next.snapshotIntervalHours = Math.max(0, Number(args.snapshot_interval_hours))
         if (args && args.snapshot_retention !== undefined) next.snapshotRetention = Math.max(0, Number(args.snapshot_retention))
+        if (args && args.cpu_quota !== undefined) next.cpuQuota = Math.max(0, Number(args.cpu_quota) || 0)
+        if (args && args.memory_quota !== undefined) {
+          const mib = sizeToMiB(args.memory_quota) || (/^[0-9]+$/.test(String(args.memory_quota).trim()) ? Number(args.memory_quota) : 0)
+          next.memoryQuotaMiB = Math.max(0, mib)
+        }
         state.policies[sessionId] = next
         saveState()
         pushAudit(sessionId, null, 'vm_policy', { next }, true, null)
-        return { ok: true, sessionId, policy: next }
+        return { ok: true, sessionId, policy: next, usage: sessionResourceUsage(sessionId) }
       },
     })
 
@@ -3815,6 +3901,37 @@ registerTool({
         return { ok: true, machine: target.name, operation: 'withdraw', removed, stoppedJobs, sharesRevoked, snapshot: snapshot ? snapshot.name : null }
       },
     })
+
+    registerTool({
+      name: 'vm_queue',
+      description: '创建排队(D4):operation=list|cancel。list 查看本会话排队中的 vm_create 请求(含位置/状态);cancel 按 queue_id 取消。每当配额释放,队列会自动推进(FIFO)。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['list', 'cancel'], description: '操作类型,默认 list。' },
+          queue_id: { type: 'string', description: 'cancel 时指定。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const op = (args && args.operation) || 'list'
+        const q = (state.queue && state.queue[sessionId]) || []
+        if (op === 'cancel') {
+          const id = String((args && args.queue_id) || '').trim()
+          const idx = q.findIndex((i) => i.id === id)
+          if (idx < 0) throw new Error('未找到该排队请求')
+          const [item] = q.splice(idx, 1)
+          if (q.length === 0) delete state.queue[sessionId]
+          else state.queue[sessionId] = q
+          saveState()
+          pushAudit(sessionId, null, 'vm_queue_cancel', { id }, true, null)
+          return { ok: true, cancelled: item.id }
+        }
+        return { ok: true, queue: q.map((x, i) => ({ id: x.id, position: i + 1, status: x.status, distro: x.req && x.req.distro, cpus: x.req && x.req.cpus, memory: x.req && x.req.memory, createdAt: x.createdAt, machine: x.machine || null, error: x.error || null })) }
+      },
+    })
   }
 
   try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.3.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
@@ -3841,6 +3958,8 @@ export const __vmsb = {
   injectVaultText, redactVaultText, redactDeep,
   // C1 增强指标/告警测试接缝
   parseProbeOutput, metricValueOf, evalAlert, sampleAllMetrics, evaluateAlerts, metricsView, PROBE_CMD,
+  // D4 配额/排队测试接缝
+  state, quotaState, sessionResourceUsage, sessionPolicy, processQueuedCreations,
 }
 // ---- 模板库 ----
 function builtinTemplates() {

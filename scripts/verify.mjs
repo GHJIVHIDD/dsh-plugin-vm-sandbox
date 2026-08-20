@@ -48,7 +48,7 @@ const requiredTools = [
   'vm_cron', 'vm_template', 'vm_resize', 'vm_metrics', 'vm_export', 'vm_import',
   'vm_service_discover', 'vm_service_register',
   'vm_harden', 'vm_secret', 'vm_alert',
-  'vm_scp', 'vm_logs', 'vm_env', 'vm_withdraw',
+  'vm_scp', 'vm_logs', 'vm_env', 'vm_withdraw', 'vm_queue',
 ]
 
 const missing = requiredTools.filter((name) => !toolsMap[name])
@@ -58,7 +58,7 @@ if (missing.length) {
 }
 
 const requiredParams = {
-  vm_create: ['cpus', 'memory', 'disk', 'init_script', 'cloud_init', 'isolated', 'isolate_network', 'template'],
+  vm_create: ['cpus', 'memory', 'disk', 'init_script', 'cloud_init', 'isolated', 'isolate_network', 'template', 'harden', 'queue'],
   vm_exec: ['machines', 'groups', 'strategy'],
   vm_snapshot: ['machine', 'note'],
   vm_restore: ['snapshot'],
@@ -73,7 +73,7 @@ const requiredParams = {
   vm_audit: ['machine', 'operation', 'limit'],
   vm_share: ['machine', 'session', 'mode'],
   vm_network: ['public_access', 'internal_access', 'isolated', 'isolate_network'],
-  vm_policy: ['max_machines', 'idle_sleep_minutes', 'idle_delete_days', 'snapshot_interval_hours', 'snapshot_retention'],
+  vm_policy: ['max_machines', 'idle_sleep_minutes', 'idle_delete_days', 'snapshot_interval_hours', 'snapshot_retention', 'cpu_quota', 'memory_quota'],
   vm_cron: ['operation', 'machine', 'command', 'expr'],
   vm_template: ['operation', 'name', 'init_script', 'cloud_init'],
   vm_resize: ['machine', 'cpus', 'memory', 'disk'],
@@ -90,6 +90,7 @@ const requiredParams = {
   vm_logs: ['machine', 'job_id', 'limit', 'max_bytes'],
   vm_env: ['operation', 'name', 'value'],
   vm_withdraw: ['machine', 'keep_snapshot', 'note'],
+  vm_queue: ['operation', 'queue_id'],
 }
 
 const failures = []
