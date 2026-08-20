@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-plugin-vm-sandbox",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "OrbStack VM sandbox v0.4.0: 在 v0.3(安全/可靠性)基础上新增 A1 交互终端、A3 场景化一键创建、A4 删除撤销+完成通知、A5 配额一眼可见、A6 协作分组、B1 安全基线 vm_harden、B2 密钥库 vm_secret、C1 增强指标+阈值告警 vm_alert、D1 vm_scp/vm_logs/vm_env/vm_withdraw、D2 调度 UI+用量报表 vm_report、D3 导出分片/远端、D4 累计配额+创建排队。",
   "type": "module",
   "scripts": {
