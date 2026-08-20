@@ -48,6 +48,7 @@ const requiredTools = [
   'vm_cron', 'vm_template', 'vm_resize', 'vm_metrics', 'vm_export', 'vm_import',
   'vm_service_discover', 'vm_service_register',
   'vm_harden', 'vm_secret', 'vm_alert',
+  'vm_scp', 'vm_logs', 'vm_env', 'vm_withdraw',
 ]
 
 const missing = requiredTools.filter((name) => !toolsMap[name])
@@ -85,6 +86,10 @@ const requiredParams = {
   vm_harden: ['operation', 'machine'],
   vm_secret: ['operation', 'name', 'value'],
   vm_alert: ['operation', 'name', 'metric', 'op', 'value'],
+  vm_scp: ['direction', 'machines', 'files', 'local_path', 'remote_path'],
+  vm_logs: ['machine', 'job_id', 'limit', 'max_bytes'],
+  vm_env: ['operation', 'name', 'value'],
+  vm_withdraw: ['machine', 'keep_snapshot', 'note'],
 }
 
 const failures = []

@@ -3633,6 +3633,188 @@ registerTool({
         }
       },
     })
+
+    registerTool({
+      name: 'vm_scp',
+      description: '批量文件分发(D1):上传/下载任意文件集合到单台或多台机器(fan-out)。direction=upload|download;files 为 [{local_path, remote_path}] 数组,或用单个 local_path/remote_path 简写;machines 为目标机器数组(或单 machine)。权限复用 exec 权限。',
+      parameters: {
+        type: 'object',
+        properties: {
+          direction: { type: 'string', enum: ['upload', 'download'], description: '方向,默认 upload。' },
+          machines: { type: 'array', items: { type: 'string' }, description: '目标机器数组(至少一台)。' },
+          machine: { type: 'string', description: '或单台目标机器。' },
+          files: { type: 'array', items: { type: 'object', properties: { local_path: { type: 'string' }, remote_path: { type: 'string' } } }, description: '文件对数组。' },
+          local_path: { type: 'string', description: '简写:单对文件的本地路径(local 亦可)。' },
+          remote_path: { type: 'string', description: '简写:单对文件的远端路径(remote 亦可)。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const t0 = Date.now()
+        try {
+          const direction = (args && args.direction) === 'download' ? 'download' : 'upload'
+          const machines = Array.isArray(args && args.machines) ? args.machines.map(sanitizeName).filter(Boolean) : [sanitizeName(args && args.machine)].filter(Boolean)
+          if (machines.length === 0) throw new Error('需要 machines 或 machine')
+          let files = Array.isArray(args && args.files)
+            ? args.files.map((f) => ({ local: f && f.local_path, remote: f && f.remote_path })).filter((f) => f.local && f.remote)
+            : []
+          if (files.length === 0 && (args && (args.local_path || args.local)) && (args && (args.remote_path || args.remote))) {
+            files = [{ local: args.local_path || args.local, remote: args.remote_path || args.remote }]
+          }
+          if (files.length === 0) throw new Error('需要 files 或 local_path+remote_path')
+          const results = []
+          for (const m of Array.from(new Set(machines))) {
+            const owner = ownerOfMachine(m)
+            if (owner && !canExec(sessionId, m)) throw new Error('没有权限: ' + m + '(请先 vm_share)')
+            const target = owner ? await resolveExistingMachineByName(ctx, sessionId, m) : await resolveMachineByName(ctx, sessionId, m)
+            await ensureRunning(target.name)
+            for (const f of files) {
+              let local
+              try { local = resolveLocalPath(ctx, f.local) } catch (e) { results.push({ machine: target.name, localPath: f.local, ok: false, error: String(e.message || e) }); continue }
+              const remote = String(f.remote || '')
+              if (!remote.trim()) { results.push({ machine: target.name, ok: false, error: 'remote_path 不能为空' }); continue }
+              if (direction === 'download') {
+                if ((String(local).endsWith('/') || String(local).endsWith(sep)) && !existsSync(local)) { try { mkdirSync(local, { recursive: true }) } catch (e) { /* ignore */ } }
+                const res = await orb(['pull', '-m', target.name, remote, local], { timeoutMs: 600000 })
+                results.push({ machine: target.name, direction, localPath: local, remotePath: remote, ok: res.exitCode === 0, error: res.exitCode === 0 ? null : String(res.stderr || res.stdout || '').slice(0, 300) })
+              } else {
+                if (!existsSync(local)) { results.push({ machine: target.name, localPath: local, ok: false, error: '本地文件不存在' }); continue }
+                const res = await orb(['push', '-m', target.name, local, remote], { timeoutMs: 600000 })
+                results.push({ machine: target.name, direction, localPath: local, remotePath: remote, ok: res.exitCode === 0, error: res.exitCode === 0 ? null : String(res.stderr || res.stdout || '').slice(0, 300) })
+              }
+            }
+          }
+          const okCount = results.filter((r) => r.ok).length
+          pushAudit(sessionId, machines.join(','), 'vm_scp', { direction, files: files.length, ok: okCount + '/' + results.length }, okCount === results.length, okCount === results.length ? null : '部分失败', Date.now() - t0)
+          return { ok: true, direction, files: files.length, success: okCount + '/' + results.length, results }
+        } catch (err) {
+          pushAudit(sessionId, null, 'vm_scp', {}, false, String((err && err.message) || err), Date.now() - t0)
+          throw err
+        }
+      },
+    })
+
+    registerTool({
+      name: 'vm_logs',
+      description: '统一日志视图(D1):vm_logs { machine?, job_id?, limit, max_bytes }。job_id 给单个任务日志尾部;否则返回该机器最近的 Shell 命令记录 + 各后台任务尾部。',
+      parameters: {
+        type: 'object',
+        properties: {
+          machine: { type: 'string', description: '目标机器;省略使用当前会话默认机器。' },
+          job_id: { type: 'string', description: '给单个任务 id 时返回其日志。' },
+          limit: { type: 'integer', description: 'shell 记录条数,默认 20。' },
+          max_bytes: { type: 'integer', description: '任务日志最大字节,默认 8192。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const jobId = String((args && args.job_id) || '').trim()
+        if (jobId) {
+          const job = jobById(jobId)
+          if (!job) throw new Error('未找到任务: ' + jobId)
+          if (!canExec(sessionId, job.machine)) throw new Error('没有权限查看该任务日志')
+          return { ok: true, jobId, machine: job.machine, log: (await jobFullOutput(jobId, Number(args && args.max_bytes) || 8192)).log }
+        }
+        const hint = sanitizeName(args && args.machine)
+        const target = hint ? await resolveExistingMachineByName(ctx, sessionId, hint) : await resolveDefaultMachine(ctx, sessionId)
+        if (!canExec(sessionId, target.name)) throw new Error('没有权限查看日志(' + target.name + ')')
+        const limit = Math.min(100, Number(args && args.limit) || 20)
+        const shell = (shellLogs.get(target.name) || []).slice(-limit).reverse().map((e) => ({ id: e.id, ts: e.startTime, status: e.status, exitCode: e.exitCode, command: e.command, stdout: (e.stdout || '').slice(0, 2000), stderr: (e.stderr || '').slice(0, 1000) }))
+        const jobs = []
+        for (const j of state.jobs.filter((x) => x.machine === target.name).reverse().slice(0, limit)) {
+          const s = await readJobStatus(j).catch(() => ({ status: j.status }))
+          jobs.push({ id: j.id, status: s.status, command: j.command, tail: s.tail || '' })
+        }
+        return { ok: true, machine: target.name, shell, jobs }
+      },
+    })
+
+    registerTool({
+      name: 'vm_env',
+      description: '环境变量库(D1):operation=set/get/list/rm。与 vm_secret 共用一个加密 vault(区分 kind=env),init_script/cloud_init 里可用 {{env:name}} 注入;审计脱敏同样生效(受保护的是 value,env 通常非敏感)。',
+      parameters: {
+        type: 'object',
+        properties: {
+          operation: { type: 'string', enum: ['set', 'get', 'list', 'rm'], description: '操作类型,默认 list。' },
+          name: { type: 'string', description: '变量名(字母数字._-)。' },
+          value: { type: 'string', description: 'set 时的值。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const op = (args && args.operation) || 'list'
+        const name = String((args && args.name) || '').trim()
+        try {
+          if (op === 'set') {
+            if (!/^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$/.test(name)) throw new Error('name 需为合法标识符(<=64)')
+            if (args === null || args === undefined || args.value === undefined || args.value === null) throw new Error('value 不能为空')
+            vaultSet(name, String(args.value), 'env')
+            pushAudit(sessionId, null, 'vm_env_set', { name }, true, null)
+            return { ok: true, name, set: true }
+          }
+          if (op === 'get') {
+            if (!name) throw new Error('缺少 name')
+            const v = vaultGet(name)
+            if (v === null) throw new Error('未找到变量: ' + name)
+            pushAudit(sessionId, null, 'vm_env_get', { name }, true, null)
+            return { ok: true, name, value: v }
+          }
+          if (op === 'rm') {
+            if (!name) throw new Error('缺少 name')
+            pushAudit(sessionId, null, 'vm_env_rm', { name }, true, null)
+            return { ok: true, name, removed: vaultRemove(name) }
+          }
+          pushAudit(sessionId, null, 'vm_env_list', {}, true, null)
+          return { ok: true, envs: vaultList().filter((e) => e.kind === 'env').map((e) => ({ name: e.name, updatedAt: e.updatedAt })) }
+        } catch (err) {
+          pushAudit(sessionId, null, 'vm_env_' + op, { name }, false, String((err && err.message) || err))
+          throw err
+        }
+      },
+    })
+
+    registerTool({
+      name: 'vm_withdraw',
+      description: '安全下线(D1):停止该机器所有运行中后台任务、停止端口转发、撤销全部共享、可选先快照(keep_snapshot),然后删除机器。需要 owner 权限。',
+      parameters: {
+        type: 'object',
+        properties: {
+          machine: { type: 'string', description: '目标机器;省略使用当前会话默认机器。' },
+          keep_snapshot: { type: 'boolean', description: '删除前先创建快照(默认 false)。' },
+          note: { type: 'string', description: '快照备注。' },
+        },
+      },
+      output: OUT,
+      async execute(args, exec) {
+        const sessionId = sessionIdOf(exec)
+        if (!sessionId) throw new Error('无法确定当前会话')
+        const hint = sanitizeName(args && args.machine)
+        const target = hint ? await resolveExistingMachineByName(ctx, sessionId, hint) : await resolveDefaultMachine(ctx, sessionId)
+        if (!canOwner(sessionId, target.name)) throw new Error('只有归属会话可以下线该机器')
+        const t0 = Date.now()
+        let stoppedJobs = 0
+        for (const j of state.jobs) {
+          if (j.machine === target.name && j.status === 'running') { try { await stopJob(ctx, sessionId, j.id) } catch (e) { /* ignore */ } stoppedJobs++ }
+        }
+        stopMachineTunnels(target.name)
+        const sharesRevoked = (state.shares[target.name] || []).length
+        delete state.shares[target.name]
+        let snapshot = null
+        if (args && args.keep_snapshot) {
+          try { snapshot = (await createSnapshot(ctx, sessionId, target.name, String((args && args.note) || 'withdraw-before-delete'))).snapshot } catch (e) { /* 快照失败继续下线 */ }
+        }
+        const removed = await removeMachineByName(target.name)
+        saveState()
+        pushAudit(sessionId, target.name, 'vm_withdraw', { stoppedJobs, sharesRevoked, snapshot: snapshot ? snapshot.name : null }, true, null, Date.now() - t0)
+        return { ok: true, machine: target.name, operation: 'withdraw', removed, stoppedJobs, sharesRevoked, snapshot: snapshot ? snapshot.name : null }
+      },
+    })
   }
 
   try { console.log('[vmsb] VM sandbox deployment plugin ready (v0.3.0, cap ' + MAX_RUNNING + ', max-per-session ' + MAX_PER_SESSION + ')') } catch (e) { /* ignore */ }
