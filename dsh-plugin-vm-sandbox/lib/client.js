@@ -252,42 +252,61 @@ window.__ModuleLoader__.load({
 			const [err, setErr] = React.useState(null);
 			const termRef = React.useRef(null);
 			const esRef = React.useRef(null);
+			const startedRef = React.useRef(false);
 			const start = React.useCallback(() => {
+				if (startedRef.current) return;
+				startedRef.current = true;
 				setState("connecting"); setErr(null);
-				apiPost("term", { session: sessionId, machine }).then(() => loadXterm(), (e) => { throw new Error(String((e && e.message) || e)); })
+				apiPost("term", { session: sessionId, machine })
+					.then(() => loadXterm())
 					.then((Terminal) => {
-						if (!hostRef.current) return;
-						const t = new Terminal({ cursorBlink: true, fontSize: 12, scrollback: 2000 });
-						t.open(hostRef.current);
-						termRef.current = t;
-						t.writeln("(已连接,回车取提示符…)\r\n");
-						const es = new EventSource("/vmsb-api/term/stream?session=" + encodeURIComponent(sessionId) + "&machine=" + encodeURIComponent(machine));
-						esRef.current = es;
-						es.addEventListener("out", (ev) => { try { t.write(b64ToBytes(ev.data)); } catch (e2) { /* ignore */ } });
-						es.addEventListener("closed", () => { try { t.writeln("\r\n[终端已关闭]"); } catch (e2) { /* ignore */ } });
-						es.onopen = () => { try { t.write("\r"); } catch (e2) { /* ignore */ } };
-						es.onerror = () => { setErr("连接中断"); setState("error"); };
-						t.onData((d) => apiPost("term/input", { session: sessionId, machine, data: strToB64(d) }));
-						t.onResize((d) => apiPost("term/input", { session: sessionId, machine, cols: d.cols, rows: d.rows }));
-						setState("on");
-					}, (e) => { setErr(String((e && e.message) || e)); setState("error"); });
+						const open = () => {
+							const el = hostRef.current;
+							if (!el || termRef.current) return !!termRef.current;
+							const t = new Terminal({ cursorBlink: true, fontSize: 12, scrollback: 2000 });
+							t.open(el);
+							termRef.current = t;
+							t.writeln("(已连接,回车取提示符…)\r\n");
+							const es = new EventSource("/vmsb-api/term/stream?session=" + encodeURIComponent(sessionId) + "&machine=" + encodeURIComponent(machine));
+							esRef.current = es;
+							es.addEventListener("out", (ev) => { try { t.write(b64ToBytes(ev.data)); } catch (e2) { /* ignore */ } });
+							es.addEventListener("closed", () => { try { t.writeln("\r\n[终端已关闭]\r\n"); } catch (e2) { /* ignore */ } });
+							es.onopen = () => { try { t.write("\r"); t.focus(); } catch (e2) { /* ignore */ } };
+							es.onerror = () => { if (esRef.current === es && startedRef.current) setErr("连接中断,浏览器将自动重试"); };
+							t.onData((d) => apiPost("term/input", { session: sessionId, machine, data: strToB64(d) }));
+							t.onResize((d) => apiPost("term/input", { session: sessionId, machine, cols: d.cols, rows: d.rows }));
+							setState("on");
+							try { t.focus(); } catch (e2) { /* ignore */ }
+							return true;
+						};
+						if (!open()) {
+							// 容器节点尚未就绪:下一帧重试(消除挂载竞态)
+							window.setTimeout(() => { if (!open() && startedRef.current) setErr("终端容器未就绪,请重试"); }, 120);
+						}
+					}, (e) => { setErr(String((e && e.message) || e)); setState("error"); startedRef.current = false; });
 			}, [machine, sessionId]);
 			const stop = React.useCallback(() => {
+				startedRef.current = false;
 				if (esRef.current) { try { esRef.current.close(); } catch (e) { /* ignore */ } esRef.current = null; }
 				if (termRef.current) { try { termRef.current.dispose(); } catch (e) { /* ignore */ } termRef.current = null; }
 				apiPost("term/close", { session: sessionId, machine });
 				setState("off"); setErr(null);
 			}, [machine, sessionId]);
 			React.useEffect(() => () => { if (esRef.current) esRef.current.close(); }, []);
+			const active = state === "on" || state === "connecting";
 			return React.createElement("div", null,
-				state === "on" || state === "connecting"
-					? React.createElement("div", { ref: hostRef, style: { height: 260, marginTop: 6, padding: 4, background: "#0b0d11", borderRadius: 6, overflow: "hidden" } })
-					: React.createElement("div", { className: "vmsb-shell-empty" }, "终端未打开" + (err ? " — " + err : "")),
+				React.createElement("div", {
+					ref: hostRef,
+					onClick: () => { if (termRef.current) { try { termRef.current.focus(); } catch (e2) { /* ignore */ } } },
+					style: active
+						? { height: 260, marginTop: 6, padding: 4, background: "#0b0d11", borderRadius: 6, overflow: "hidden" }
+						: { display: "none" },
+				}),
 				err ? React.createElement("div", { className: "vmsb-error", style: { marginTop: 4 } }, err) : null,
 				React.createElement("div", { style: { marginTop: 4 } },
-					state === "on" || state === "connecting"
+					active
 						? React.createElement("button", { className: "vmsb-btn", onClick: stop }, "关闭终端")
-						: React.createElement("button", { className: "vmsb-btn", onClick: start, disabled: state === "connecting" }, "打开终端"),
+						: React.createElement("button", { className: "vmsb-btn", onClick: start }, "打开终端"),
 				),
 			);
 		}
@@ -515,6 +534,19 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 				}
 			}, [confirmDel, doDelete]);
 
+			// 快照行删除(与机器删除区分,避免走 /vmsb-api/delete 报「请用 vm_snapshot_delete」)
+			const onDeleteSnapshot = React.useCallback((name) => {
+				if (confirmDel === name) {
+					apiPost("snapshot", { action: "delete", snapshot: name, session: sessionId }).then(
+						() => { setConfirmDel(null); showToast("快照已删除: " + name); refreshList(); },
+						(err) => { setConfirmDel(null); setError(String((err && err.message) || err)); },
+					);
+				} else {
+					setConfirmDel(name);
+					window.setTimeout(() => setConfirmDel((c) => (c === name ? null : c)), 3000);
+				}
+			}, [confirmDel, sessionId, refreshList, showToast]);
+
 			const toggle = React.useCallback((name) => {
 				if (expanded === name) {
 					setExpanded(null);
@@ -623,27 +655,32 @@ const [auditFilter, setAuditFilter] = React.useState({ machine: "", operation: "
 				const isOwn = isOwnByM(m);
 				const busyName = busy[m.name];
 				const isOpen = expanded === m.name;
+				const isSnap = m.kind === "snapshot";
 				return React.createElement("div", { key: m.name, className: "vmsb-item" },
 					React.createElement("div", { className: "vmsb-row" + (isOwn ? " vmsb-row-own" : "") + (isOpen ? " vmsb-row-open" : ""), onClick: () => toggle(m.name) },
 						React.createElement("span", { className: "vmsb-chev" }, "▸"),
-						React.createElement("span", { className: "vmsb-dot " + (DOT_CLASS[m.state] || "vmsb-dot-stop") }),
+						React.createElement("span", { className: "vmsb-dot vmsb-dot-stop" }),
 						React.createElement("span", { className: "vmsb-name" }, m.name),
-						React.createElement("span", { className: "vmsb-meta" }, (m.distro || "?") + (m.version ? " " + m.version : "")),
-						React.createElement("span", { className: "vmsb-state " + (STATE_TEXT_CLASS[m.state] || "").trim() }, STATE_LABEL[m.state] || m.state),
+						React.createElement("span", { className: "vmsb-meta" }, isSnap ? ("快照 · " + (m.source || "?")) : ((m.distro || "?") + (m.version ? " " + m.version : ""))),
+						React.createElement("span", { className: "vmsb-state " + (STATE_TEXT_CLASS[m.state] || "").trim() }, isSnap ? "快照" : (STATE_LABEL[m.state] || m.state)),
 						React.createElement("span", { className: "vmsb-owner" }, m.owner ? (m.owner.title || m.owner.sessionId) : "未归属"),
-						m.kind === "snapshot" ? React.createElement("span", { className: "vmsb-own-tag" }, "快照") : null,
-						isOwn ? React.createElement("span", { className: "vmsb-own-tag" }, "本会话") : (isSharedToMe(m) ? React.createElement("span", { className: "vmsb-own-tag" }, "共享给我") : null),
+						isSnap ? React.createElement("span", { className: "vmsb-own-tag" }, "快照") : (isOwn ? React.createElement("span", { className: "vmsb-own-tag" }, "本会话") : (isSharedToMe(m) ? React.createElement("span", { className: "vmsb-own-tag" }, "共享给我") : null)),
 						React.createElement("span", { className: "vmsb-actions" },
-							m.state !== "running"
-								? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("start", m.name); } }, busyName === "start" ? "启动中…" : "启动")
-								: React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("sleep", m.name); } }, busyName === "sleep" ? "休眠中…" : "休眠"),
-							m.state === "running"
-								? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("restart", m.name); } }, busyName === "restart" ? "重启中…" : "重启")
-								: null,
-							(!m.owner || isOwn)
-								? React.createElement("button", { className: "vmsb-btn vmsb-danger", disabled: !!busyName, onClick: (e) => { stop(e); onDelete(m.name); } },
-									busyName === "delete" ? "删除中…" : (confirmDel === m.name ? "确认删除?" : "删除"))
-								: null,
+							isSnap
+								? React.createElement("button", { className: "vmsb-btn vmsb-danger", onClick: (e) => { stop(e); onDeleteSnapshot(m.name); } },
+									confirmDel === m.name ? "确认删除?" : "删除")
+								: React.createElement(React.Fragment, null,
+									m.state !== "running"
+										? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("start", m.name); } }, busyName === "start" ? "启动中…" : "启动")
+										: React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("sleep", m.name); } }, busyName === "sleep" ? "休眠中…" : "休眠"),
+									m.state === "running"
+										? React.createElement("button", { className: "vmsb-btn", disabled: !!busyName, onClick: (e) => { stop(e); act("restart", m.name); } }, busyName === "restart" ? "重启中…" : "重启")
+										: null,
+									(!m.owner || isOwn)
+										? React.createElement("button", { className: "vmsb-btn vmsb-danger", disabled: !!busyName, onClick: (e) => { stop(e); onDelete(m.name); } },
+											busyName === "delete" ? "删除中…" : (confirmDel === m.name ? "确认删除?" : "删除"))
+										: null,
+								),
 						),
 					),
 					renderDetail(m),

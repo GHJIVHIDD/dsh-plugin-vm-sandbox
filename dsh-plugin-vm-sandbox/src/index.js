@@ -642,6 +642,8 @@ async function createMachineWithName(ctx, sessionId, name, distro, signal, opts)
     })
     state.machines[sessionId] = list
     saveState()
+    // 创建是元数据强一致操作:立即落盘,避免进程在去抖窗口内退出导致新机器变成「未归属」孤儿
+    flushStateNow()
     await enforceRunningCap(name)
     await ensureNetworkApplied(name)
     // B1: 默认创建后进行安全基线加固(幂等,失败不阻断创建)
@@ -751,6 +753,8 @@ async function removeMachineByName(name) {
     else state.machines[sid] = next
   }
   if (changed) saveState()
+  // 删除是元数据强一致操作:立即落盘,避免进程重启后留下「无主」孤儿机器
+  flushStateNow()
   return ok
 }
 
@@ -1096,6 +1100,7 @@ async function createSnapshot(ctx, sessionId, name, note) {
     note: String(note || '').slice(0, 500),
   }
   saveState()
+  flushStateNow()
   return { ok: true, snapshot: rec, state: 'stopped', note: '快照为 OrbStack clone，数据按需复制，不占用双倍磁盘' }
 }
 
@@ -1147,6 +1152,7 @@ async function deleteSnapshot(ctx, sessionId, snapshotName) {
   }
   delete state.snapshots[snapshotName]
   saveState()
+  flushStateNow()
   return { ok: true, snapshot: snapshotName }
 }
 
@@ -2303,7 +2309,9 @@ function apply(ctx) {
         if (!name) throw new Error('缺少机器名称')
         const found = recordOfMachine(name)
         if (found && found.type === 'snapshot') throw new Error('快照请使用 vm_snapshot_delete 删除')
-        if (!canOwner(sessionId, name)) throw new Error('该机器属于其他会话或未获得删除权限，不能删除')
+        const owner = ownerOfMachine(name)
+        // 允许删除「未归属」的孤儿机器(无 state 记录);有主则由归属会话删
+        if (owner && owner !== sessionId) throw new Error('该机器属于其他会话或未获得删除权限，不能删除')
         // A4: 删除前自动打撤销快照(默认开,undo=false 关闭;快照配额满则忽略)
         let undoSnapshot = null
         if (q.get('undo') !== '0' && q.get('undo') !== 'false') {
@@ -2887,7 +2895,8 @@ registerTool({
           if (name) {
             const found = recordOfMachine(name)
             if (found && found.type === 'snapshot') throw new Error('快照请使用 vm_snapshot_delete 删除')
-            if (!canOwner(sessionId, name)) throw new Error('该机器属于其他会话，不能删除')
+            const owner = ownerOfMachine(name)
+            if (owner && owner !== sessionId) throw new Error('该机器属于其他会话，不能删除')
             const removed = await removeMachineByName(name)
             pushAudit(sessionId, name, 'vm_delete', {}, removed, removed ? null : '删除失败', Date.now() - t0)
             return { ok: removed, machine: name, sessionMachines: sessionMachines(sessionId).map((r) => r.name) }
@@ -4091,7 +4100,8 @@ registerTool({
         if (!sessionId) throw new Error('无法确定当前会话')
         const hint = sanitizeName(args && args.machine)
         const target = hint ? await resolveExistingMachineByName(ctx, sessionId, hint) : await resolveDefaultMachine(ctx, sessionId)
-        if (!canOwner(sessionId, target.name)) throw new Error('只有归属会话可以下线该机器')
+        const wOwner = ownerOfMachine(target.name)
+        if (wOwner && wOwner !== sessionId) throw new Error('只有归属会话可以下线该机器')
         const t0 = Date.now()
         let stoppedJobs = 0
         for (const j of state.jobs) {
@@ -4525,6 +4535,7 @@ async function importMachine(ctx, sessionId, inputPath, nameHint, distro) {
   list.push({ name, distro: distro === 'alpine' ? 'alpine' : 'debian', createdAt: Date.now(), lastUsedAt: Date.now(), imported: true })
   state.machines[sessionId] = list
   saveState()
+  flushStateNow()
   return { ok: true, machine: name }
 }
 
